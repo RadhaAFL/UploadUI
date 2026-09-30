@@ -1,0 +1,210 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --red:       #C8102E;
+  --red-dark:  #a00d24;
+  --red-light: #fdeaed;
+  --red-mid:   #f5c0c9;
+  --white:     #ffffff;
+  --grey-50:   #fafafa;
+  --grey-100:  #f4f4f4;
+  --grey-200:  #e8e8e8;
+  --grey-400:  #aaa;
+  --grey-600:  #666;
+  --grey-900:  #1a1a1a;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,.07);
+  --shadow-md: 0 4px 16px rgba(0,0,0,.10);
+  --radius:    8px;
+  --r-sm:      5px;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background: #f5f5f5;
+  color: var(--grey-900);
+  min-height: 100vh;
+}
+
+/* ── Shared buttons ─────────────────────────────────────────────────────── */
+.btn-primary, .btn-outline {
+  height: 36px; padding: 0 20px; border-radius: var(--r-sm);
+  font-size: 13.5px; font-weight: 600; font-family: inherit;
+  cursor: pointer; border: 2px solid var(--red);
+  display: inline-flex; align-items: center; gap: 7px;
+  transition: background .15s, color .15s, opacity .15s;
+  white-space: nowrap;
+}
+.btn-primary { background: var(--red); color: var(--white); }
+.btn-primary:hover:not(:disabled) { background: var(--red-dark); border-color: var(--red-dark); }
+.btn-outline { background: var(--white); color: var(--red); }
+.btn-outline:hover:not(:disabled) { background: var(--red-light); }
+.btn-primary:disabled, .btn-outline:disabled { opacity: .4; cursor: not-allowed; }
+
+.btn-back-portals {
+  height: 30px; padding: 0 14px; border-radius: var(--r-sm);
+  border: 1.5px solid var(--grey-200); background: var(--white);
+  color: var(--grey-900); font-size: 12.5px; font-weight: 600;
+  font-family: inherit; cursor: pointer;
+}
+.btn-back-portals:hover { border-color: var(--red); color: var(--red); }
+
+.btn-signout {
+  height: 30px; padding: 0 14px; border-radius: var(--r-sm);
+  border: 1.5px solid rgba(255,255,255,.45); background: transparent;
+  color: white; font-size: 12.5px; font-weight: 600; font-family: inherit;
+  cursor: pointer; transition: background .15s;
+}
+.btn-signout:hover { background: rgba(255,255,255,.15); }
+
+.header-brand-badge {
+  font-size: 11px; font-weight: 700;
+  background: rgba(255,255,255,.18);
+  border: 1px solid rgba(255,255,255,.3);
+  border-radius: 99px; padding: 3px 12px;
+}
+
+.spinner {
+  width: 13px; height: 13px;
+  border: 2px solid rgba(255,255,255,.35); border-top-color: white;
+  border-radius: 50%; animation: spin .7s linear infinite; display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.error-bar {
+  background: #fff0f2; border: 1.5px solid var(--red-mid);
+  color: var(--red-dark); padding: 10px 16px; border-radius: var(--radius);
+  font-size: 13px; margin-bottom: 14px;
+}
+
+/* ── Shared "kpi-*" header/table look (matches SEMANTIC-LAYER's input portals) ── */
+.kpi-header {
+  height: 64px; display: flex; align-items: center; justify-content: space-between;
+  gap: 18px; padding: 0 24px; background: var(--red); border-bottom: 1px solid rgba(0,0,0,.08);
+}
+.kpi-header-left, .kpi-header-right { display: flex; align-items: center; gap: 14px; }
+.kpi-logo { height: 34px; width: auto; object-fit: contain; background: #fff; border-radius: 6px; padding: 3px 10px; }
+.kpi-title { font-size: 16px; font-weight: 700; color: var(--white); }
+.kpi-subtitle, .kpi-user { font-size: 12px; color: rgba(255,255,255,.8); }
+
+.kpi-state {
+  background: var(--white); border: 1px solid var(--grey-200); border-radius: var(--radius);
+  padding: 28px; color: var(--grey-600); text-align: center;
+}
+
+.kpi-table-wrap { overflow-x: auto; }
+.kpi-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kpi-table th {
+  text-align: left; padding: 10px 12px; background: var(--grey-50);
+  border-bottom: 1px solid var(--grey-200); color: var(--grey-600); font-size: 12px;
+}
+.kpi-table td { padding: 8px 12px; border-bottom: 1px solid var(--grey-100); vertical-align: middle; }
+
+@media (max-width: 760px) {
+  .kpi-header { height: auto; padding: 12px 16px; align-items: flex-start; flex-direction: column; }
+}
+
+/* ── Portal Home (card list) ────────────────────────────────────────────── */
+.ph-bg { min-height: 100vh; background: #f0f2f5; display: flex; flex-direction: column; }
+.ph-header {
+  display: flex; align-items: center; gap: 12px; padding: 0 28px; height: 56px;
+  background: #1a1a2e; color: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.25); flex-shrink: 0;
+}
+.ph-logo-img { height: 32px; object-fit: contain; }
+.ph-header-title { font-size: 1.05rem; font-weight: 600; letter-spacing: .3px; flex: 1; }
+.ph-header-right { display: flex; align-items: center; gap: 10px; }
+.ph-user { font-size: .85rem; opacity: .8; }
+
+.ph-main { flex: 1; padding: 48px 32px 64px; max-width: 1100px; margin: 0 auto; width: 100%; }
+.ph-hero { text-align: center; margin-bottom: 40px; }
+.ph-hero-title { font-size: 1.9rem; font-weight: 700; color: #1a1a2e; margin: 0 0 8px; }
+.ph-hero-sub { font-size: 1rem; color: #666; margin: 0; }
+
+.ph-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+.ph-card {
+  background: #fff; border-radius: 12px; border: 1.5px solid #e0e4ef; padding: 24px 20px;
+  cursor: pointer; display: flex; align-items: flex-start; gap: 16px;
+  transition: box-shadow .18s, border-color .18s, transform .18s; position: relative;
+}
+.ph-card:hover { box-shadow: 0 6px 24px rgba(26,58,143,.12); border-color: #3b82f6; transform: translateY(-2px); }
+.ph-card-icon { font-size: 2rem; flex-shrink: 0; line-height: 1; margin-top: 2px; }
+.ph-card-body { flex: 1; min-width: 0; }
+.ph-card-name { font-size: 1.05rem; font-weight: 600; color: #1a1a2e; margin-bottom: 5px; }
+.ph-card-desc { font-size: .85rem; color: #555; line-height: 1.45; margin-bottom: 10px; }
+.ph-card-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ph-card-restrict { font-size: .75rem; background: #fff3e0; color: #e65100; padding: 2px 8px; border-radius: 20px; font-weight: 500; }
+.ph-card-arrow { font-size: 1.3rem; color: #aaa; flex-shrink: 0; transition: color .15s, transform .15s; }
+.ph-card:hover .ph-card-arrow { color: #3b82f6; transform: translateX(3px); }
+
+.ph-card-skeleton {
+  height: 110px; background: linear-gradient(90deg, #e8ecf0 25%, #f5f7fa 50%, #e8ecf0 75%);
+  background-size: 200% 100%; animation: ph-shimmer 1.4s infinite; cursor: default; pointer-events: none;
+}
+@keyframes ph-shimmer { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }
+
+.ph-error { background: #fff3f3; border: 1px solid #fca5a5; border-radius: 8px; padding: 16px 20px; color: #b91c1c; font-size: .9rem; }
+.ph-empty { text-align: center; padding: 60px 20px; color: #777; }
+.ph-empty-icon { font-size: 3rem; margin-bottom: 16px; }
+.ph-empty-hint { font-size: .85rem; color: #aaa; margin-top: 6px; }
+
+/* ── Auth (login / access denied) ──────────────────────────────────────── */
+.auth-bg {
+  min-height: 100vh; background: linear-gradient(135deg, #1a0509 0%, #6b0518 50%, #C8102E 100%);
+  display: flex; align-items: center; justify-content: center;
+}
+.auth-split {
+  display: flex; width: 100%; max-width: 960px; min-height: 560px; border-radius: 16px;
+  overflow: hidden; box-shadow: 0 24px 64px rgba(0,0,0,.45); margin: 24px;
+}
+.auth-panel-left {
+  flex: 1; background: rgba(0,0,0,.25); backdrop-filter: blur(8px); padding: 56px 48px;
+  display: flex; flex-direction: column; justify-content: space-between; color: #fff;
+  border-right: 1px solid rgba(255,255,255,.1);
+}
+.auth-brand { display: flex; flex-direction: column; gap: 14px; }
+.auth-logo-wrap { background: #fff; border-radius: 10px; padding: 10px 20px; display: inline-flex; align-items: center; width: fit-content; }
+.auth-logo-img { height: 36px; width: auto; object-fit: contain; display: block; }
+.auth-brand h1 { font-size: 28px; font-weight: 800; letter-spacing: -.01em; margin: 0; }
+.auth-brand p { font-size: 14px; opacity: .7; margin: 0; }
+.auth-tagline { display: flex; flex-direction: column; gap: 12px; }
+.auth-feature { font-size: 14px; opacity: .8; display: flex; align-items: center; gap: 8px; }
+
+.auth-panel-right { width: 400px; background: #fff; display: flex; align-items: center; justify-content: center; padding: 48px 40px; }
+.auth-card { width: 100%; display: flex; flex-direction: column; gap: 18px; }
+.auth-card-logo { display: flex; justify-content: center; margin-bottom: 4px; }
+.auth-card-logo-img { height: 40px; width: auto; object-fit: contain; }
+.auth-title { font-size: 24px; font-weight: 700; color: #1a1a1a; margin: 0; text-align: center; }
+.auth-subtitle { font-size: 14px; color: #666; margin: 0; text-align: center; line-height: 1.5; }
+
+.ms-btn {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  width: 100%; height: 48px; background: #fff; color: #1a1a1a;
+  border: 1.5px solid #ddd; border-radius: 8px; font-size: 15px; font-weight: 600; font-family: inherit;
+  cursor: pointer; transition: background .15s, box-shadow .15s; box-shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+.ms-btn:hover:not(:disabled) { background: #f8f8f8; box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+.ms-btn:disabled { opacity: .6; cursor: not-allowed; }
+.ms-btn-outline { background: transparent; color: #C8102E; border-color: #C8102E; }
+.ms-btn-outline:hover { background: #fdeaed; }
+
+.auth-footer { font-size: 11.5px; color: #aaa; text-align: center; margin: 0; line-height: 1.5; }
+.auth-spinner {
+  width: 18px; height: 18px; border: 2px solid #ddd; border-top-color: #C8102E;
+  border-radius: 50%; animation: auth-spin .7s linear infinite; flex-shrink: 0;
+}
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+
+.auth-center-card {
+  background: #fff; border-radius: 16px; box-shadow: 0 24px 64px rgba(0,0,0,.4);
+  padding: 56px 48px; max-width: 440px; width: 100%; margin: 24px; text-align: center;
+  display: flex; flex-direction: column; gap: 14px; align-items: center;
+}
+.auth-denied-icon { font-size: 52px; }
+.auth-center-card h2 { font-size: 24px; font-weight: 700; color: #C8102E; margin: 0; }
+.auth-center-card p { font-size: 14px; color: #444; margin: 0; line-height: 1.6; }
+.auth-denied-hint { font-size: 13px; color: #aaa; }
+
+@media (max-width: 700px) {
+  .auth-split { flex-direction: column; }
+  .auth-panel-left { padding: 36px 28px; min-height: 180px; }
+  .auth-panel-right { width: 100%; padding: 36px 28px; }
+}

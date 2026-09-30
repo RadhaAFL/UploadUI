@@ -1,0 +1,8 @@
+flask>=3.0
+flask-cors>=4.0
+pyodbc>=5.0
+duckdb>=0.10
+pandas>=2.0
+openpyxl>=3.1
+python-dotenv>=1.0
+gunicorn>=22.0; platform_system != "Windows"
