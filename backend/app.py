@@ -30,6 +30,7 @@ CORS(app)
 # ── Local data paths ───────────────────────────────────────────────────────
 DATA_ROOT = os.path.join(os.path.dirname(__file__), '..', 'data')
 DB_PATH   = os.path.join(DATA_ROOT, 'app.duckdb')
+os.makedirs(DATA_ROOT, exist_ok=True)  # data/ is gitignored — won't exist on a fresh clone
 
 # Single persistent DuckDB connection + lock — same convention as
 # SEMANTIC-LAYER's get_con()/_db_lock and Money Mapping's app.py
