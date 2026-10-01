@@ -380,14 +380,40 @@ def _build_upload_rows(df, config: dict, restrict_values):
     }
 
 
-def _upload_insert_sql(config: dict):
+def _upload_insert_columns(config: dict):
     cols = [c['key'] for c in config.get('columns', [])]
     audit = config.get('audit_columns') or {}
     audit_cols = [audit[k] for k in ('file_name', 'run_date', 'load_run_date') if audit.get(k)]
-    all_cols = cols + audit_cols
-    col_sql = ', '.join(f'[{c}]' for c in all_cols)
-    placeholders = ', '.join(['?'] * len(all_cols))
-    return f"INSERT INTO {config['target_table']} ({col_sql}) VALUES ({placeholders})", cols, audit_cols
+    return cols + audit_cols, cols, audit_cols
+
+
+def _bulk_insert_rows(cursor, table: str, columns: list, rows: list, batch_size: int = 150):
+    """Insert rows via multi-row VALUES batches.
+
+    cursor.executemany() with fast_executemany=True was measured against
+    Fabric's ODBC endpoint at ~3-7 rows/sec — no faster than a plain
+    per-row loop, meaning the driver silently isn't getting a server-side
+    bulk-RPC speedup through this path (a known pyodbc/driver-combination
+    gap, not something Python can detect ahead of time). A single
+    multi-row INSERT statement per batch sidesteps that entirely: it's one
+    network round trip per `batch_size` rows regardless of what the driver
+    does internally. SQL Server caps a statement at 2100 parameters;
+    batch_size is kept well under that for any reasonable column count.
+    """
+    if not rows:
+        return
+    col_sql = ', '.join(f'[{c}]' for c in columns)
+    n_cols = len(columns)
+    total = len(rows)
+    inserted = 0
+    for i in range(0, total, batch_size):
+        chunk = rows[i:i + batch_size]
+        placeholders = ', '.join('(' + ', '.join(['?'] * n_cols) + ')' for _ in chunk)
+        params = [v for row in chunk for v in row]
+        cursor.execute(f"INSERT INTO {table} ({col_sql}) VALUES {placeholders}", params)
+        inserted += len(chunk)
+        if inserted % (batch_size * 20) == 0 or inserted == total:
+            print(f"Upload commit: inserted {inserted}/{total} rows into {table}", flush=True)
 
 
 def _cleanup_expired_uploads():
@@ -529,17 +555,17 @@ def start_upload():
 
         load_run_date = datetime.utcnow().strftime('%Y%m%d%H%M%S')
         run_date_str = date.today().isoformat()
-        insert_sql, cols, audit_cols = _upload_insert_sql(config)
+        all_cols, cols, audit_cols = _upload_insert_columns(config)
         staged_rows = [row + [filename, run_date_str, load_run_date] for row in result['rows']]
 
         upload_id = uuid.uuid4().hex
         with _upload_lock:
             _upload_staging[upload_id] = {
                 "portal_id":  portal_id,
+                "columns":    all_cols,
                 "email":      email,
                 "config":     config,
                 "rows":       staged_rows,
-                "insert_sql": insert_sql,
                 "brands_in_file": result['brands_in_file'],
                 "period":     result['period'],
                 "load_run_date": load_run_date,
@@ -604,13 +630,7 @@ def commit_upload():
                 cursor.execute(f"DELETE FROM {table} WHERE {' AND '.join(where)}", params)
                 deleted = cursor.rowcount if (cursor.rowcount or 0) > 0 else 0
 
-            try:
-                cursor.fast_executemany = True
-                cursor.executemany(staged['insert_sql'], staged['rows'])
-            except Exception:
-                cursor.fast_executemany = False
-                for row in staged['rows']:
-                    cursor.execute(staged['insert_sql'], row)
+            _bulk_insert_rows(cursor, table, staged['columns'], staged['rows'])
 
             verified = len(staged['rows'])
             load_run_col = (config.get('audit_columns') or {}).get('load_run_date')
