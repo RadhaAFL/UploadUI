@@ -426,9 +426,10 @@ def my_portals():
         email = request.args.get('email', '').strip().lower()
         if not email:
             return jsonify({"error": "email required"}), 400
+        is_admin = _is_admin(email)  # acquires/releases _db_lock on its own — must not nest it below
         with _db_lock:
             con = get_con()
-            if _is_admin(email):
+            if is_admin:
                 rows = con.execute(
                     "SELECT id, name, description, config FROM portals WHERE is_active=TRUE ORDER BY created_at"
                 ).fetchall()
