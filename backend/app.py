@@ -11,6 +11,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import io
 import json
+import math
 import os
 import pandas as pd
 import pyodbc
@@ -305,6 +306,23 @@ def _target_float(val):
         return None
 
 
+# SQL Server's float holds 0 and magnitudes from ~2.23e-308 to ~1.80e+308.
+# NaN, +/-Infinity and anything smaller than that are rejected with error 8023.
+_SQL_FLOAT_MIN = 2.2250738585072014e-308
+
+
+def _sql_float_or_none(v):
+    """A clean float SQL Server will accept, else None (stored as NULL)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    if math.isnan(f) or math.isinf(f):
+        return None
+    if f != 0.0 and abs(f) < _SQL_FLOAT_MIN:
+        return None
+    return f
+
+
 def _upload_numeric(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
@@ -351,19 +369,22 @@ def _build_upload_rows(df, config: dict, restrict_values):
         if key == date_col:
             continue
         if key in numeric_keys:
-            work[key] = work[key].apply(_upload_numeric)
-            # Defensive: _upload_numeric should only ever produce None or a
-            # float, but a stray value (e.g. an Excel error-cell string
-            # like '#DIV/0!' that survives str->float conversion attempts)
-            # must never reach the ODBC layer, where it fails the whole
-            # batch with an opaque "not a valid instance of data type
-            # float" error. Force anything else to NULL and log what it was.
-            bad = work[key].apply(lambda v: v is not None and not isinstance(v, float))
-            if bad.any():
-                examples = work.loc[bad, key].head(3).tolist()
-                print(f"Upload validate: {int(bad.sum())} {key} value(s) were not cleanly "
-                      f"numeric after conversion; forcing to NULL. Examples: {examples}", flush=True)
-                work.loc[bad, key] = None
+            converted = work[key].apply(_upload_numeric)
+            # Built by hand as an object column on purpose: Series.apply/map
+            # turn None into NaN as soon as the column also holds floats, and
+            # a NaN that reaches the driver fails the whole insert batch with
+            # "not a valid instance of data type float" (SQL Server error
+            # 8023). Every blank or unusable value must arrive as None (NULL).
+            cleaned, forced = [], []
+            for v in converted.tolist():
+                ok = _sql_float_or_none(v)
+                if ok is None and v is not None and not (isinstance(v, float) and math.isnan(v)):
+                    forced.append(v)   # real data the warehouse can't hold; a plain blank is expected
+                cleaned.append(ok)
+            work[key] = pd.Series(cleaned, index=work.index, dtype=object)
+            if forced:
+                print(f"Upload validate: {len(forced)} {key} value(s) can't be stored as a SQL Server "
+                      f"float; loading as NULL. Examples: {forced[:3]}", flush=True)
             null_counts[key] = int(work[key].isna().sum())
         else:
             work[key] = work[key].apply(_cell_to_str)
@@ -508,20 +529,31 @@ def my_portals():
 
 @app.route('/portals/<portal_id>/access', methods=['POST'])
 def set_portal_access(portal_id):
-    """Admin: grant/update a user's access to a portal."""
+    """Admin: grant/update access to a portal. Takes `email` or a list in
+    `emails` (the console's "comma-separated for multiple"); every address
+    gets the same restrict_values. Re-granting an existing user updates them."""
     err = _require_admin()
     if err: return err
     try:
         body = request.get_json() or {}
-        email = body.get('email', '').strip().lower()
-        values = body.get('restrict_values', [])
-        if not email:
+        raw = body.get('emails') if isinstance(body.get('emails'), list) else [body.get('email', '')]
+        emails = list(dict.fromkeys(str(e).strip().lower() for e in raw if str(e).strip()))
+        values = [str(v).strip() for v in (body.get('restrict_values') or []) if str(v).strip()]
+        if not emails:
             return jsonify({"error": "email required"}), 400
+        invalid = [e for e in emails if not _EMAIL_RE.match(e) or len(e) > 254]
+        if invalid:
+            return jsonify({"error": f"Not a valid email address: {', '.join(invalid[:5])}"}), 400
         with _db_lock:
             con = get_con()
-            con.execute("DELETE FROM portal_access WHERE portal_id=? AND LOWER(email)=?", [portal_id, email])
-            con.execute("INSERT INTO portal_access VALUES (?,?,?)", [portal_id, email, json.dumps(values)])
-        return jsonify({"status": "ok"})
+            if not con.execute("SELECT 1 FROM portals WHERE id=?", [portal_id]).fetchone():
+                return jsonify({"error": f"Portal not found: {portal_id}"}), 404
+            for email in emails:
+                con.execute("DELETE FROM portal_access WHERE portal_id=? AND LOWER(email)=?", [portal_id, email])
+                con.execute("INSERT INTO portal_access VALUES (?,?,?)", [portal_id, email, json.dumps(values)])
+        _audit(str(body.get('caller_email', '')).strip().lower(), 'portal_access_set',
+               {"portal_id": portal_id, "emails": emails, "restrict_values": values})
+        return jsonify({"status": "ok", "count": len(emails)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -607,6 +639,37 @@ def admin_remove_admin():
             con.execute("DELETE FROM admins WHERE LOWER(email)=?", [email])
         _audit(caller, 'admin_remove', {"email": email})
         return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/logs', methods=['GET'])
+def admin_logs():
+    """Newest-first audit trail for the Activity Log tab. Filters: `action`
+    (exact), `q` (substring of the user's email or the details), `limit`."""
+    err = _require_admin()
+    if err: return err
+    try:
+        action = request.args.get('action', '').strip()
+        q = request.args.get('q', '').strip().lower()
+        try:
+            limit = max(1, min(int(request.args.get('limit', 200)), 1000))
+        except ValueError:
+            limit = 200
+        like = f"%{q}%"
+        with _db_lock:
+            con = get_con()
+            rows = con.execute("""
+                SELECT id, ts, email, name, action, details FROM audit_logs
+                WHERE (? = '' OR action = ?)
+                  AND (? = '' OR LOWER(email) LIKE ? OR LOWER(details) LIKE ?)
+                ORDER BY id DESC LIMIT ?
+            """, [action, action, q, like, like, limit]).fetchall()
+            actions = [r[0] for r in con.execute("SELECT DISTINCT action FROM audit_logs ORDER BY action").fetchall()]
+        return jsonify({
+            "actions": actions,
+            "logs": [{"id": r[0], "ts": str(r[1]), "email": r[2], "name": r[3], "action": r[4], "details": r[5]} for r in rows],
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -906,7 +969,14 @@ def start_upload():
         load_run_date = datetime.utcnow().strftime('%Y%m%d%H%M%S')
         run_date_str = date.today().isoformat()
         all_cols, cols, audit_cols = _upload_insert_columns(config)
-        staged_rows = [row + [filename, run_date_str, load_run_date] for row in result['rows']]
+        # Append exactly the audit values the portal has columns for, in the
+        # same order _upload_insert_columns() lists them; a portal may name
+        # only some of them (or none), and a value without a column makes the
+        # INSERT's parameter count disagree with its placeholders.
+        audit_values = {'file_name': filename, 'run_date': run_date_str, 'load_run_date': load_run_date}
+        audit_cfg = config.get('audit_columns') or {}
+        extras = [audit_values[k] for k in ('file_name', 'run_date', 'load_run_date') if audit_cfg.get(k)]
+        staged_rows = [row + extras for row in result['rows']]
 
         upload_id = uuid.uuid4().hex
         with _upload_lock:
