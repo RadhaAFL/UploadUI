@@ -15,6 +15,14 @@ export function portalPath(portal) {
   return `${basePath()}upload/${portal.id}`
 }
 
+// 'admin' is reserved: the backend refuses to create a portal with that id.
+export const ADMIN_SEGMENT = 'admin'
+
+export function pushAdminPath() {
+  const url = `${basePath()}${ADMIN_SEGMENT}`
+  if (window.location.pathname !== url) window.history.pushState({}, '', url)
+}
+
 /** Returns { portalId } | null based on the current URL. */
 export function parseCurrentPath() {
   const base = basePath()

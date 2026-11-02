@@ -4,8 +4,9 @@ import { loginRequest, msalInstance } from './authConfig'
 import { logEvent } from './logger'
 import UploadPortalHome from './UploadPortalHome'
 import UploadPortal from './UploadPortal'
+import AdminConsole from './AdminConsole'
 import arvindLogo from './assets/arvind-logo.png'
-import { parseCurrentPath, pushHomePath, pushPortalPath } from './routing'
+import { ADMIN_SEGMENT, parseCurrentPath, pushAdminPath, pushHomePath, pushPortalPath } from './routing'
 
 const API = '/uploadportal-api'
 
@@ -75,6 +76,7 @@ export default function AuthWrapper() {
   const [access, setAccess]     = useState(undefined) // undefined = loading
   const [activePortal, setActivePortal] = useState(null)
   const [deepLink] = useState(() => parseCurrentPath())
+  const [showAdmin, setShowAdmin] = useState(() => parseCurrentPath()?.portalId === ADMIN_SEGMENT)
 
   useEffect(() => {
     if (!isAuthenticated || !accounts.length) {
@@ -118,12 +120,18 @@ export default function AuthWrapper() {
   if (access === undefined) return null
   if (access === null) return <AccessDenied email={accounts[0]?.username || ''} />
 
+  // Admin-only: a non-admin who opens /admin just lands on the portal list.
+  if (showAdmin && access.isAdmin) {
+    return <AdminConsole user={access} onBack={() => { setShowAdmin(false); pushHomePath() }} />
+  }
+
   if (!activePortal) {
     return (
       <UploadPortalHome
         user={access}
-        deepLinkPortalId={deepLink?.portalId || null}
+        deepLinkPortalId={deepLink?.portalId && deepLink.portalId !== ADMIN_SEGMENT ? deepLink.portalId : null}
         onSelect={portal => { setActivePortal(portal); pushPortalPath(portal) }}
+        onOpenAdmin={() => { setShowAdmin(true); pushAdminPath() }}
         onSignOut={() => msalInstance.logoutRedirect()}
       />
     )

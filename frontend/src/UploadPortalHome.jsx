@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import arvindLogo from './assets/arvind-logo.png'
 
-export default function UploadPortalHome({ user, onSelect, onSignOut, deepLinkPortalId }) {
+export default function UploadPortalHome({ user, onSelect, onSignOut, onOpenAdmin, deepLinkPortalId }) {
   const [portals, setPortals] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError]     = useState(null)
@@ -33,6 +33,7 @@ export default function UploadPortalHome({ user, onSelect, onSignOut, deepLinkPo
         <div className="ph-header-title">Upload Portal</div>
         <div className="ph-header-right">
           <span className="ph-user">{user.displayName}</span>
+          {user.isAdmin && <button className="btn-signout" onClick={onOpenAdmin}>Admin console</button>}
           <button className="btn-signout" onClick={onSignOut}>Sign out</button>
         </div>
       </header>

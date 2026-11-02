@@ -15,6 +15,15 @@ function restrictionText(vals) {
     .join(' · ')
 }
 
+// What an upload will do to the target table, in the words a user needs
+// before pressing confirm. `strategy` comes from the portal's load_strategy.
+function loadRuleText(strategy, table, period, brands) {
+  if (strategy === 'truncate_load') return `This replaces ALL existing data in ${table} with your file.`
+  if (strategy === 'append') return `This adds your rows to the existing data in ${table}. Nothing is deleted.`
+  const brandPart = brands?.length ? ` for ${brands.join(', ')}` : ''
+  return `This replaces existing ${period?.label || 'matching'} data${brandPart} with your file.`
+}
+
 export default function UploadPortal({ user, portal, onBack }) {
   const [template, setTemplate]   = useState(null)
   const [loading, setLoading]     = useState(true)
@@ -94,6 +103,9 @@ export default function UploadPortal({ user, portal, onBack }) {
 
   const columns = template?.columns || []
   const period = template?.period
+  const strategy = template?.load_strategy || 'replace_period'
+  const sampleUrl = format =>
+    `${API}/portals/${encodeURIComponent(portal.id)}/sample-template?format=${format}`
 
   const nullWarnings = useMemo(() => {
     if (!staged?.null_counts) return []
@@ -139,8 +151,22 @@ export default function UploadPortal({ user, portal, onBack }) {
               </section>
             )}
 
+            <section className={`up-rule-card ${strategy === 'truncate_load' ? 'up-rule-warn' : ''}`}>
+              <div className="up-rule-head">What this upload does</div>
+              <div className="up-rule-body">
+                {loadRuleText(strategy, template.target_table, period, null)}
+              </div>
+            </section>
+
             <section className="up-columns-card">
-              <div className="up-columns-head">Required columns</div>
+              <div className="up-columns-top">
+                <div className="up-columns-head">Required columns</div>
+                <div className="up-sample-links">
+                  <span className="up-sample-label">Not sure of the format? Download a sample template:</span>
+                  <a className="btn-outline up-sample-btn" href={sampleUrl('xlsx')} download>Excel (.xlsx)</a>
+                  <a className="btn-outline up-sample-btn" href={sampleUrl('csv')} download>CSV</a>
+                </div>
+              </div>
               <div className="up-columns-list">
                 {columns.map(c => (
                   <span key={c.key} className={`up-col-chip ${c.numeric ? 'up-col-numeric' : ''}`}>
@@ -209,8 +235,8 @@ export default function UploadPortal({ user, portal, onBack }) {
 
                 <div className="up-confirm-bar">
                   <div className="up-confirm-text">
-                    This will replace existing {staged.period?.label || 'matching'} data
-                    {staged.brands_in_file?.length > 0 && <> for {staged.brands_in_file.join(', ')}</>} with the {staged.row_count.toLocaleString('en-IN')} rows above.
+                    {loadRuleText(staged.load_strategy || strategy, template.target_table, staged.period, staged.brands_in_file)}
+                    {' '}{staged.row_count.toLocaleString('en-IN')} rows will be loaded.
                   </div>
                   <button className="btn-primary" onClick={handleCommit} disabled={committing}>
                     {committing ? (<><span className="spinner" /> Uploading…</>) : 'Confirm & Upload'}
@@ -225,8 +251,8 @@ export default function UploadPortal({ user, portal, onBack }) {
                 <div className="up-result-title">Upload complete</div>
                 <div className="up-result-body">
                   <strong>{result.inserted.toLocaleString('en-IN')}</strong> rows inserted
-                  {result.deleted > 0 && <> · <strong>{result.deleted.toLocaleString('en-IN')}</strong> existing rows replaced</>}
-                  {' '}for <strong>{result.period?.label}</strong>
+                  {result.deleted > 0 && <> · <strong>{result.deleted.toLocaleString('en-IN')}</strong> existing rows {result.load_strategy === 'truncate_load' ? 'removed' : 'replaced'}</>}
+                  {result.period && <> for <strong>{result.period.label}</strong></>}
                   {result.brands?.length > 0 && <> ({result.brands.join(', ')})</>}.
                   {' '}Verified <strong>{result.verified.toLocaleString('en-IN')}</strong> rows in {result.table}.
                 </div>

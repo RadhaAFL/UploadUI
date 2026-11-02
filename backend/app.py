@@ -7,8 +7,9 @@ file against an admin-defined template + period rule, then replace matching
 rows in the target Fabric table.
 Runs on port 5003, proxied by Apache at /uploadportal-api/
 """
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+import io
 import json
 import os
 import pandas as pd
@@ -23,6 +24,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import duckdb
+
+import load_strategies
+import portal_config
+import portal_hooks
 
 app = Flask(__name__)
 CORS(app)
@@ -87,6 +92,7 @@ BOOTSTRAP_ADMIN = "radhakishan.thakur@arvindfashions.com"
 # portal can define its own cadence/cutover — this is not hardcoded.
 MONTHLY_STORE_TARGET_UPLOAD_CONFIG = {
     "target_table": "prd.DIM_MNL_XSTORE_SALES_TARGET_MASTER",
+    "load_strategy": "replace_period",
     "date_column": "BUSINESS_DATE",
     "restrict_col": "BRAND",
     "period_rule": {"unit": "month", "cutover_day": 25},
@@ -324,7 +330,15 @@ def _build_upload_rows(df, config: dict, restrict_values):
 
     bad_dates = 0
     if date_col:
-        parsed = pd.to_datetime(work[date_col], errors='coerce')
+        # Without an explicit format pandas guesses month-first, so a text
+        # date like 01-08-2026 silently becomes 8 January. A portal whose
+        # files carry day-first text dates sets `date_format` (e.g. %d-%m-%Y);
+        # real Excel date cells parse correctly either way.
+        date_format = config.get('date_format') or None
+        parsed = pd.to_datetime(
+            work[date_col], format=date_format, errors='coerce',
+            dayfirst=bool(date_format and date_format.lstrip().startswith('%d')),  # silences pandas' dayfirst warning
+        )
         bad_dates = int(parsed.isna().sum())
         work[date_col] = parsed.dt.date
     if bad_dates:
@@ -338,6 +352,18 @@ def _build_upload_rows(df, config: dict, restrict_values):
             continue
         if key in numeric_keys:
             work[key] = work[key].apply(_upload_numeric)
+            # Defensive: _upload_numeric should only ever produce None or a
+            # float, but a stray value (e.g. an Excel error-cell string
+            # like '#DIV/0!' that survives str->float conversion attempts)
+            # must never reach the ODBC layer, where it fails the whole
+            # batch with an opaque "not a valid instance of data type
+            # float" error. Force anything else to NULL and log what it was.
+            bad = work[key].apply(lambda v: v is not None and not isinstance(v, float))
+            if bad.any():
+                examples = work.loc[bad, key].head(3).tolist()
+                print(f"Upload validate: {int(bad.sum())} {key} value(s) were not cleanly "
+                      f"numeric after conversion; forcing to NULL. Examples: {examples}", flush=True)
+                work.loc[bad, key] = None
             null_counts[key] = int(work[key].isna().sum())
         else:
             work[key] = work[key].apply(_cell_to_str)
@@ -500,6 +526,259 @@ def set_portal_access(portal_id):
         return jsonify({"error": str(e)}), 500
 
 
+# ── Admin: portal definitions (Phase 2) ────────────────────────────────────
+
+def _audit(email: str, action: str, details: dict):
+    with _db_lock:
+        con = get_con()
+        next_id = con.execute("SELECT COALESCE(MAX(id),0)+1 FROM audit_logs").fetchone()[0]
+        con.execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?)", [
+            next_id, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), email, '', action, json.dumps(details),
+        ])
+
+
+def _portal_admin_view(row, access_count: int) -> dict:
+    portal_id = row[0]
+    config = json.loads(row[3])
+    return {
+        "id": portal_id, "name": row[1], "description": row[2], "config": config,
+        "created_at": str(row[4]), "is_active": bool(row[5]),
+        "load_strategy": load_strategies.strategy_of(config),
+        "access_count": access_count,
+        "hook_file": f"backend/portals/{portal_id}.py",
+        "has_hooks": portal_hooks.has_hooks(portal_id),
+    }
+
+
+@app.route('/admin/strategies', methods=['GET'])
+def admin_strategies():
+    err = _require_admin()
+    if err: return err
+    return jsonify({"strategies": [
+        {"id": k, "label": v["label"], "summary": v["summary"], "needs_period": v["needs_period"]}
+        for k, v in load_strategies.STRATEGIES.items()
+    ]})
+
+
+@app.route('/admin/portals', methods=['GET'])
+def admin_list_portals():
+    err = _require_admin()
+    if err: return err
+    try:
+        with _db_lock:
+            con = get_con()
+            rows = con.execute(
+                "SELECT id, name, description, config, created_at, is_active FROM portals ORDER BY created_at"
+            ).fetchall()
+            counts = dict(con.execute("SELECT portal_id, COUNT(*) FROM portal_access GROUP BY portal_id").fetchall())
+        return jsonify({"portals": [_portal_admin_view(r, counts.get(r[0], 0)) for r in rows]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/portals', methods=['POST'])
+def admin_create_portal():
+    err = _require_admin()
+    if err: return err
+    try:
+        body = request.get_json() or {}
+        caller = str(body.get('caller_email', '')).strip().lower()
+        portal_id = str(body.get('id', '')).strip()
+        name = str(body.get('name', '')).strip()
+        if not portal_hooks.valid_portal_id(portal_id):
+            return jsonify({"error": "Portal id must be lowercase letters, digits, '-' or '_' (max 63 chars)."}), 400
+        if portal_id == 'admin':  # the frontend serves the admin console at /admin
+            return jsonify({"error": "'admin' is a reserved portal id."}), 400
+        if not name:
+            return jsonify({"error": "name is required"}), 400
+        config = portal_config.validate_portal_config(body.get('config'))
+
+        with _db_lock:
+            con = get_con()
+            if con.execute("SELECT 1 FROM portals WHERE id=?", [portal_id]).fetchone():
+                return jsonify({"error": f"A portal with id '{portal_id}' already exists."}), 409
+            con.execute("INSERT INTO portals VALUES (?,?,?,?,?,?)", [
+                portal_id, name, str(body.get('description', '')).strip(), json.dumps(config),
+                datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), True,
+            ])
+        _audit(caller, 'portal_create', {"portal_id": portal_id, "strategy": config['load_strategy']})
+        return jsonify({"status": "ok", "id": portal_id}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/portals/<portal_id>', methods=['PUT'])
+def admin_update_portal(portal_id):
+    err = _require_admin()
+    if err: return err
+    try:
+        body = request.get_json() or {}
+        caller = str(body.get('caller_email', '')).strip().lower()
+        name = str(body.get('name', '')).strip()
+        if not name:
+            return jsonify({"error": "name is required"}), 400
+        config = portal_config.validate_portal_config(body.get('config'))
+
+        with _db_lock:
+            con = get_con()
+            existing = con.execute("SELECT is_active FROM portals WHERE id=?", [portal_id]).fetchone()
+            if not existing:
+                return jsonify({"error": f"Portal not found: {portal_id}"}), 404
+            is_active = bool(body['is_active']) if 'is_active' in body else bool(existing[0])
+            con.execute(
+                "UPDATE portals SET name=?, description=?, config=?, is_active=? WHERE id=?",
+                [name, str(body.get('description', '')).strip(), json.dumps(config), is_active, portal_id],
+            )
+        _audit(caller, 'portal_update', {"portal_id": portal_id, "strategy": config['load_strategy'], "is_active": is_active})
+        return jsonify({"status": "ok"})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/portals/<portal_id>', methods=['DELETE'])
+def admin_deactivate_portal(portal_id):
+    """Soft delete: hides the portal from every user list but keeps its
+    config and access rows so it can be switched back on (PUT is_active)."""
+    err = _require_admin()
+    if err: return err
+    try:
+        with _db_lock:
+            con = get_con()
+            if not con.execute("SELECT 1 FROM portals WHERE id=?", [portal_id]).fetchone():
+                return jsonify({"error": f"Portal not found: {portal_id}"}), 404
+            con.execute("UPDATE portals SET is_active=FALSE WHERE id=?", [portal_id])
+        _audit(request.args.get('caller_email', '').strip().lower(), 'portal_deactivate', {"portal_id": portal_id})
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/portals/<portal_id>/access', methods=['GET'])
+def admin_list_access(portal_id):
+    err = _require_admin()
+    if err: return err
+    try:
+        with _db_lock:
+            rows = get_con().execute(
+                "SELECT email, restrict_values FROM portal_access WHERE portal_id=? ORDER BY email", [portal_id]
+            ).fetchall()
+        return jsonify({"access": [
+            {"email": r[0], "restrict_values": json.loads(r[1]) if r[1] else []} for r in rows
+        ]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/portals/<portal_id>/access', methods=['DELETE'])
+def admin_remove_access(portal_id):
+    err = _require_admin()
+    if err: return err
+    try:
+        email = request.args.get('email', '').strip().lower()
+        if not email:
+            return jsonify({"error": "email required"}), 400
+        with _db_lock:
+            get_con().execute("DELETE FROM portal_access WHERE portal_id=? AND LOWER(email)=?", [portal_id, email])
+        _audit(request.args.get('caller_email', '').strip().lower(), 'portal_access_remove',
+               {"portal_id": portal_id, "email": email})
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Sample template download (Phase 1) ─────────────────────────────────────
+
+def _example_value(col: dict, config: dict, period: "dict | None") -> str:
+    if col.get('example'):
+        return col['example']
+    if col['key'] == config.get('date_column'):
+        day = date.fromisoformat(period['start']) if period else date.today()
+        return day.strftime(config.get('date_format') or '%Y-%m-%d')
+    return '1234.50' if col.get('numeric') else 'Text'
+
+
+def _sample_template_file(portal: dict, fmt: str):
+    """Build the downloadable template. The data sheet holds the header row
+    only — an example row there could be uploaded by mistake as real data —
+    so the worked example lives on a separate Instructions sheet."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    config = portal['config']
+    columns = config.get('columns', [])
+    keys = [c['key'] for c in columns]
+
+    if fmt == 'csv':
+        return (','.join(keys) + '\n').encode('utf-8'), 'text/csv'
+
+    period = _period_for_rule(config.get('period_rule'))
+    strategy = load_strategies.strategy_of(config)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Template'   # first sheet: the only one the uploader reads
+    ws.append(keys)
+    header_fill = PatternFill('solid', fgColor='1F4E78')
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = header_fill
+    for i, key in enumerate(keys, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(14, len(key) + 4)
+    ws.freeze_panes = 'A2'
+
+    info = wb.create_sheet('Instructions')
+    info.append([portal['name']])
+    info['A1'].font = Font(bold=True, size=14)
+    info.append([])
+    info.append(['How to use'])
+    info['A3'].font = Font(bold=True)
+    info.append(['1. Fill in the Template sheet starting at row 2. Do not rename, reorder or add columns.'])
+    info.append(['2. Save and upload the file in the portal.'])
+    info.append([f"What the upload does: {load_strategies.STRATEGIES[strategy]['summary']}"])
+    if period:
+        info.append([f"Expected period right now: {period['label']} ({period['start']} to {period['end']}). "
+                     f"Uploads on or after day {period['cutover_day']} of the month count toward the next month."])
+    info.append([])
+    info.append(['Column', 'Meaning', 'Type', 'Example'])
+    for cell in info[info.max_row]:
+        cell.font = Font(bold=True)
+    for c in columns:
+        kind = 'Number' if c.get('numeric') else ('Date' if c['key'] == config.get('date_column') else 'Text')
+        info.append([c['key'], c.get('description') or c.get('label') or c['key'], kind,
+                     _example_value(c, config, period)])
+    info.column_dimensions['A'].width = 22
+    info.column_dimensions['B'].width = 46
+    info.column_dimensions['C'].width = 10
+    info.column_dimensions['D'].width = 18
+    for row in info.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=False, vertical='top')
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue(), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+
+@app.route('/portals/<portal_id>/sample-template', methods=['GET'])
+def sample_template(portal_id):
+    try:
+        fmt = request.args.get('format', 'xlsx').strip().lower()
+        if fmt not in ('xlsx', 'csv'):
+            return jsonify({"error": "format must be xlsx or csv"}), 400
+        portal = _load_portal(portal_id)
+        data, mimetype = _sample_template_file(portal, fmt)
+        return send_file(io.BytesIO(data), mimetype=mimetype, as_attachment=True,
+                         download_name=f"{portal_id}_template.{fmt}")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ── Upload endpoints ────────────────────────────────────────────────────
 
 @app.route('/upload-template', methods=['GET'])
@@ -515,7 +794,9 @@ def get_upload_template():
             "target_table": config.get('target_table'),
             "columns":      config.get('columns', []),
             "date_column":  config.get('date_column'),
+            "date_format":  config.get('date_format'),
             "restrict_col": config.get('restrict_col'),
+            "load_strategy": load_strategies.strategy_of(config),
             "period_rule":  config.get('period_rule'),
             "period":       _period_for_rule(config.get('period_rule')),
         })
@@ -549,8 +830,16 @@ def start_upload():
 
         restrict_col = config.get('restrict_col')
         restrict_values = _load_user_restrict_values(portal_id, email, restrict_col) if restrict_col else None
+        strategy = load_strategies.strategy_of(config)
+        load_strategies.check_allowed(strategy, restrict_values)
 
         df, filename = _read_upload_file(request.files['file'])
+        hook_ctx = {
+            "portal_id": portal_id, "config": config, "email": email, "filename": filename,
+            "period": _period_for_rule(config.get('period_rule')),
+            "restrict_values": restrict_values, "table": config['target_table'],
+        }
+        df = portal_hooks.run_prepare(portal_id, df, hook_ctx)
         result = _build_upload_rows(df, config, restrict_values)
 
         load_run_date = datetime.utcnow().strftime('%Y%m%d%H%M%S')
@@ -569,6 +858,9 @@ def start_upload():
                 "brands_in_file": result['brands_in_file'],
                 "period":     result['period'],
                 "load_run_date": load_run_date,
+                "filename":   filename,
+                "restrict_values": restrict_values,
+                "load_strategy": strategy,
                 "created_at": time.time(),
             }
 
@@ -576,6 +868,7 @@ def start_upload():
             "status":     "ready",
             "upload_id":  upload_id,
             "filename":   filename,
+            "load_strategy": strategy,
             "row_count":  result['row_count'],
             "brands_in_file": result['brands_in_file'],
             "period":     result['period'],
@@ -609,10 +902,9 @@ def commit_upload():
 
         config = staged['config']
         table = config['target_table']
-        date_col = config.get('date_column')
-        restrict_col = config.get('restrict_col')
         period = staged['period']
         brands = staged['brands_in_file']
+        strategy = staged.get('load_strategy') or load_strategies.strategy_of(config)
 
         conn = None
         try:
@@ -620,15 +912,16 @@ def commit_upload():
             conn.autocommit = True
             cursor = conn.cursor()
 
-            deleted = 0
-            if period and date_col:
-                where = [f"[{date_col}] BETWEEN ? AND ?"]
-                params = [period['start'], period['end']]
-                if restrict_col and brands:
-                    where.append(f"[{restrict_col}] IN ({','.join(['?'] * len(brands))})")
-                    params += brands
-                cursor.execute(f"DELETE FROM {table} WHERE {' AND '.join(where)}", params)
-                deleted = cursor.rowcount if (cursor.rowcount or 0) > 0 else 0
+            # A portal hook's before_insert() replaces the built-in strategy's
+            # delete/truncate step; without one the configured strategy runs.
+            hook_ctx = {
+                "portal_id": staged['portal_id'], "config": config, "email": staged['email'],
+                "filename": staged.get('filename'), "period": period,
+                "restrict_values": staged.get('restrict_values'), "table": table, "brands": brands,
+            }
+            deleted = portal_hooks.run_before_insert(staged['portal_id'], cursor, hook_ctx)
+            if deleted is None:
+                deleted = load_strategies.prepare_target(strategy, cursor, config, period, brands)
 
             _bulk_insert_rows(cursor, table, staged['columns'], staged['rows'])
 
@@ -645,11 +938,13 @@ def commit_upload():
             next_id = get_con().execute("SELECT COALESCE(MAX(id),0)+1 FROM audit_logs").fetchone()[0]
             get_con().execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?)", [
                 next_id, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), email, '', 'upload_commit',
-                json.dumps({"portal_id": staged['portal_id'], "deleted": deleted, "inserted": len(staged['rows'])}),
+                json.dumps({"portal_id": staged['portal_id'], "strategy": strategy,
+                            "deleted": deleted, "inserted": len(staged['rows'])}),
             ])
 
         return jsonify({
             "status":    "ok",
+            "load_strategy": strategy,
             "deleted":   deleted,
             "inserted":  len(staged['rows']),
             "verified":  verified,

@@ -1,11 +1,17 @@
 # Upload Portal
 
-Config-driven file uploads into Microsoft Fabric Warehouse: an admin defines
-a portal's expected column layout, target table, and upload-period rule once;
-a user then logs in, picks that portal, and uploads a `.xlsx`/`.csv` file in
-the exact format required. The backend validates the file against the
-template before anything is written, then replaces the matching rows in the
-target Fabric table.
+Config-driven file uploads into Microsoft Fabric Warehouse, in three layers:
+
+1. **Users upload.** A user picks a portal, downloads its sample template,
+   and uploads a `.xlsx`/`.csv` in exactly that format. The page states what
+   the upload will do to the table before they confirm.
+2. **Admins define the rules.** In the Admin console (`/uploadUI/admin`) an
+   admin creates a portal: target table, expected columns, load strategy,
+   period rule, and who may use it. Portal-specific Python lives in
+   `backend/portals/<portal-id>.py` and ships through git.
+3. **Data lands in Fabric.** The backend validates the file in memory, then
+   applies the portal's load strategy (replace period / truncate & load /
+   append) and bulk-inserts the rows.
 
 Standalone React + Flask app — same auth (Azure AD) and data source
 (Microsoft Fabric) as the "Arvind Analytics" app
@@ -62,14 +68,20 @@ Upload_Portal/
     app.duckdb                 # Runtime metadata DB, not committed
 
   backend/
-    app.py                     # Flask API: auth, portal config, upload validation, Fabric writes
+    app.py                     # Flask API: auth, portal admin, upload validation, Fabric writes
+    load_strategies.py         # replace_period / truncate_load / append
+    portal_config.py           # Validates admin-submitted portal configs (SQL identifiers!)
+    portal_hooks.py            # Loads backend/portals/<id>.py hooks
+    portals/                   # Per-portal Python hooks, one file per portal id
+      _example_hooks.py        # Template — never loaded for a real portal
     requirements.txt
 
   frontend/
     src/
       AuthWrapper.jsx          # Microsoft login + access gate
       UploadPortalHome.jsx     # Portal (template) selector
-      UploadPortal.jsx         # Upload flow: template, period, file picker, preview, confirm
+      UploadPortal.jsx         # Upload flow: template, sample download, period, file picker, preview, confirm
+      AdminConsole.jsx         # Admin only: create/edit portals, load rules, access
       routing.js               # Minimal history.pushState routing (no router dependency)
       authConfig.js
       logger.js
@@ -149,7 +161,14 @@ Base path in production: `/uploadportal-api`
 | `GET` | `/check-access?email=` | `{allowed, is_admin}` |
 | `GET` | `/my-portals?email=` | Upload templates visible to this user |
 | `POST` | `/portals/<id>/access` | Admin: grant/update a user's access + brand restriction |
-| `GET` | `/upload-template?portal_id=` | Expected columns + live-computed expected period |
+| `GET` | `/upload-template?portal_id=` | Expected columns, load strategy + live-computed expected period |
+| `GET` | `/portals/<id>/sample-template?format=xlsx\|csv` | Downloadable template (header row only; the worked example is on the xlsx Instructions sheet) |
+| `GET` | `/admin/portals` | Admin: every portal, incl. inactive, with hook status |
+| `POST` | `/admin/portals` | Admin: create a portal `{id, name, description, config}` |
+| `PUT` | `/admin/portals/<id>` | Admin: update a portal (`is_active` re-enables it) |
+| `DELETE` | `/admin/portals/<id>` | Admin: deactivate (soft delete) |
+| `GET`/`DELETE` | `/admin/portals/<id>/access` | Admin: list / remove (`?email=`) a user's access |
+| `GET` | `/admin/strategies` | Admin: available load strategies |
 | `POST` | `/upload/start` | multipart: `portal_id, email, file` — validates only, stages result under an `upload_id` |
 | `POST` | `/upload/commit` | `{upload_id, email}` — deletes matching period+brand rows, bulk-inserts the staged rows |
 | `POST` | `/logs` | Audit log write |
@@ -160,6 +179,52 @@ admin performing the action, `email` is whoever else is referenced.
 Conflating the two was an actual bug caught during SEMANTIC-LAYER
 development — `_require_admin()` here uses the same convention for the same
 reason.
+
+## Load strategies
+
+Each portal's `config.load_strategy` decides how an upload is applied to its
+table. The strategy runs at commit time, right before the bulk insert.
+
+| Strategy | What it does | Typical use |
+|---|---|---|
+| `replace_period` | Deletes rows in the upload period (and the brands in the file), then inserts. Needs `period_rule` + `date_column`. | Monthly targets |
+| `truncate_load` | `TRUNCATE TABLE`, then inserts. Blocked for users with a brand restriction, since it wipes every brand's rows. | Store master |
+| `append` | Inserts only. Never deletes. | Sales data |
+
+Portals saved before strategies existed have no `load_strategy` and behave as
+`replace_period`. The strategy used is recorded in the audit log and shown in
+the commit result.
+
+Validation happens fully in memory before anything is written, but the Fabric
+delete/truncate and the insert are separate autocommit statements: if the
+insert fails after a `truncate_load`, the table is left empty until the
+upload is re-run.
+
+### Dates in text files
+
+pandas guesses month-first, so a text date such as `01-08-2026` is read as
+8 January, and nothing catches that on an `append` portal (no period check).
+Set `date_format` (e.g. `%d-%m-%Y`) in the portal config when its files carry
+day-first text dates. Real Excel date cells are unaffected.
+
+## Portal Python hooks
+
+For logic a built-in strategy can't express, add `backend/portals/<portal-id>.py`
+(the file name must equal the portal id). It ships through git and is never
+edited from the browser, so any change gets reviewed before it can run on the
+server. Both functions are optional; see `backend/portals/_example_hooks.py`.
+
+```python
+def prepare(df, ctx):            # after parsing, before the built-in checks
+    ...                          # return df, or raise ValueError("shown to the user")
+
+def before_insert(cursor, ctx):  # at commit; replaces the strategy's delete/truncate
+    ...                          # return how many existing rows were removed
+```
+
+The Admin console shows whether a portal's hook file exists. Hook files are
+re-read when they change, but a hook that fails to import fails the upload
+with a clear error rather than silently falling back.
 
 ## Period-rule engine (config-driven, per portal)
 
@@ -188,7 +253,7 @@ To add a portal with a different cadence (weekly, no cutover, always current
 month, etc.), extend `_period_for_rule()` with a new `unit` and give that
 portal's seeded config the matching `period_rule` — no other code changes.
 
-## Brand-restricted delete-then-insert
+## Brand-restricted delete-then-insert (`replace_period`)
 
 On commit, existing rows are deleted only for:
 
