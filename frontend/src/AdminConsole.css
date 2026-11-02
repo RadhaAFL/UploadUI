@@ -137,3 +137,35 @@
 .ad-access-add { display: grid; grid-template-columns: 1fr 1.4fr auto; gap: 8px; }
 
 .ad-actions { display: flex; justify-content: flex-end; }
+
+/* ── Administrators panel ───────────────────────────────────────────────── */
+.ad-admins { margin-top: 6px; gap: 8px; }
+.ad-admin-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #f2f4f7;
+  font-size: 13px;
+}
+.ad-admin-email { word-break: break-all; }
+.ad-you { color: #667085; font-size: 12px; }
+.ad-admin-add { display: grid; gap: 6px; margin-top: 4px; }
+.ad-admin-add input {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  min-width: 0;
+}
+.ad-inline-error {
+  background: #fff0f2;
+  border: 1px solid var(--red-mid, #f5c0c9);
+  color: var(--red-dark, #a00d24);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+}

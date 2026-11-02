@@ -550,6 +550,67 @@ def _portal_admin_view(row, access_count: int) -> dict:
     }
 
 
+_EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+
+@app.route('/admin/admins', methods=['GET'])
+def admin_list_admins():
+    err = _require_admin()
+    if err: return err
+    try:
+        with _db_lock:
+            rows = get_con().execute("SELECT LOWER(email) FROM admins ORDER BY LOWER(email)").fetchall()
+        return jsonify({"admins": [r[0] for r in rows]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/admins', methods=['POST'])
+def admin_add_admin():
+    err = _require_admin()
+    if err: return err
+    try:
+        body = request.get_json() or {}
+        caller = str(body.get('caller_email', '')).strip().lower()
+        email = str(body.get('email', '')).strip().lower()
+        if not _EMAIL_RE.match(email) or len(email) > 254:
+            return jsonify({"error": "Enter a valid email address."}), 400
+        with _db_lock:
+            con = get_con()
+            if con.execute("SELECT 1 FROM admins WHERE LOWER(email)=?", [email]).fetchone():
+                return jsonify({"error": f"{email} is already an administrator."}), 409
+            con.execute("INSERT INTO admins VALUES (?)", [email])
+        _audit(caller, 'admin_add', {"email": email})
+        return jsonify({"status": "ok", "email": email}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/admins', methods=['DELETE'])
+def admin_remove_admin():
+    """An admin cannot remove themselves: with removal limited to *other*
+    admins, at least one admin (the caller) always remains, so the portal
+    can never be locked out."""
+    err = _require_admin()
+    if err: return err
+    try:
+        caller = request.args.get('caller_email', '').strip().lower()
+        email = request.args.get('email', '').strip().lower()
+        if not email:
+            return jsonify({"error": "email required"}), 400
+        if email == caller:
+            return jsonify({"error": "You can't remove your own admin access. Ask another administrator to do it."}), 400
+        with _db_lock:
+            con = get_con()
+            if not con.execute("SELECT 1 FROM admins WHERE LOWER(email)=?", [email]).fetchone():
+                return jsonify({"error": f"{email} is not an administrator."}), 404
+            con.execute("DELETE FROM admins WHERE LOWER(email)=?", [email])
+        _audit(caller, 'admin_remove', {"email": email})
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/admin/strategies', methods=['GET'])
 def admin_strategies():
     err = _require_admin()

@@ -82,6 +82,10 @@ export default function AdminConsole({ user, onBack }) {
   const [notice, setNotice]         = useState('')
   const [access, setAccess]         = useState([])
   const [newAccess, setNewAccess]   = useState({ email: '', values: '' })
+  const [admins, setAdmins]         = useState([])
+  const [newAdmin, setNewAdmin]     = useState('')
+  const [adminError, setAdminError] = useState('')
+  const me = user.email.toLowerCase()
 
   const loadPortals = useCallback(async () => {
     const data = await adminApi(user, '/admin/portals')
@@ -89,12 +93,42 @@ export default function AdminConsole({ user, onBack }) {
     return data.portals || []
   }, [user])
 
+  const loadAdmins = useCallback(async () => {
+    try {
+      const data = await adminApi(user, '/admin/admins')
+      setAdmins(data.admins || [])
+    } catch (e) { setAdminError(e.message) }
+  }, [user])
+
+  const addAdmin = async () => {
+    const email = newAdmin.trim().toLowerCase()
+    if (!email) return
+    setAdminError('')
+    try {
+      await adminApi(user, '/admin/admins', { method: 'POST', body: { email } })
+      logEvent(user, 'admin_add', { email })
+      setNewAdmin('')
+      await loadAdmins()
+    } catch (e) { setAdminError(e.message) }
+  }
+
+  const removeAdmin = async email => {
+    if (!window.confirm(`Remove admin access for ${email}? They will still be able to use any portals they've been given access to.`)) return
+    setAdminError('')
+    try {
+      await adminApi(user, `/admin/admins?email=${encodeURIComponent(email)}`, { method: 'DELETE' })
+      logEvent(user, 'admin_remove', { email })
+      await loadAdmins()
+    } catch (e) { setAdminError(e.message) }
+  }
+
   useEffect(() => {
+    loadAdmins()
     Promise.all([adminApi(user, '/admin/strategies'), loadPortals()])
       .then(([s]) => setStrategies(s.strategies || []))
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
-  }, [user, loadPortals])
+  }, [user, loadPortals, loadAdmins])
 
   const loadAccess = useCallback(async id => {
     try {
@@ -218,6 +252,26 @@ export default function AdminConsole({ user, onBack }) {
               <div className="ad-item-table">{p.config?.target_table} · {p.access_count} user{p.access_count === 1 ? '' : 's'}</div>
             </div>
           ))}
+
+          <div className="ad-card ad-admins">
+            <div className="ad-card-head">Administrators</div>
+            <div className="ad-muted">Admins can create portals, change load rules and manage access and other admins.</div>
+            {admins.map(a => (
+              <div key={a} className="ad-admin-row">
+                <span className="ad-admin-email">{a}{a === me && <span className="ad-you"> (you)</span>}</span>
+                <button className="ad-x" disabled={a === me}
+                        title={a === me ? "You can't remove your own access" : `Remove ${a}`}
+                        onClick={() => removeAdmin(a)}>Remove</button>
+              </div>
+            ))}
+            <div className="ad-admin-add">
+              <input value={newAdmin} onChange={e => setNewAdmin(e.target.value)}
+                     onKeyDown={e => { if (e.key === 'Enter') addAdmin() }}
+                     placeholder="name@arvindfashions.com" />
+              <button className="btn-outline" onClick={addAdmin} disabled={!newAdmin.trim()}>Add admin</button>
+            </div>
+            {adminError && <div className="ad-inline-error">{adminError}</div>}
+          </div>
         </aside>
 
         <section className="ad-editor">
