@@ -75,7 +75,10 @@ export default function AuthWrapper() {
   const [signing, setSigning]   = useState(false)
   const [access, setAccess]     = useState(undefined) // undefined = loading
   const [activePortal, setActivePortal] = useState(null)
-  const [deepLink] = useState(() => parseCurrentPath())
+  // The URL's portal id is only meant to open that portal once, on arrival.
+  // It is cleared on every way out of a portal/admin page; left in place, the
+  // home list would auto-reopen the portal and "Back to Portals" would do nothing.
+  const [deepLink, setDeepLink] = useState(() => parseCurrentPath())
   const [showAdmin, setShowAdmin] = useState(() => parseCurrentPath()?.portalId === ADMIN_SEGMENT)
 
   useEffect(() => {
@@ -122,7 +125,7 @@ export default function AuthWrapper() {
 
   // Admin-only: a non-admin who opens /admin just lands on the portal list.
   if (showAdmin && access.isAdmin) {
-    return <AdminConsole user={access} onBack={() => { setShowAdmin(false); pushHomePath() }} />
+    return <AdminConsole user={access} onBack={() => { setShowAdmin(false); setDeepLink(null); pushHomePath() }} />
   }
 
   if (!activePortal) {
@@ -141,7 +144,7 @@ export default function AuthWrapper() {
     <UploadPortal
       user={access}
       portal={activePortal}
-      onBack={() => { setActivePortal(null); pushHomePath() }}
+      onBack={() => { setActivePortal(null); setDeepLink(null); pushHomePath() }}
     />
   )
 }
