@@ -6,7 +6,7 @@ const blankColumn = () => ({ key: '', label: '', numeric: false, example: '', de
 const emptyForm = () => ({
   id: '', name: '', description: '', is_active: true,
   target_table: '', staging_table: '', load_strategy: 'append', columns: [blankColumn()],
-  date_column: '', date_format: '', restrict_col: '',
+  date_column: '', date_format: '', restrict_col: '', key_columns: [],
   use_period: false, cutover_day: 25,
   audit_file_name: '', audit_run_date: '', audit_load_run_date: '',
 })
@@ -22,13 +22,14 @@ function formFromPortal(p) {
       example: col.example || '', description: col.description || '',
     })),
     date_column: c.date_column || '', date_format: c.date_format || '', restrict_col: c.restrict_col || '',
+    key_columns: c.key_columns || [],
     use_period: !!c.period_rule, cutover_day: c.period_rule?.cutover_day ?? 25,
     audit_file_name: audit.file_name || '', audit_run_date: audit.run_date || '',
     audit_load_run_date: audit.load_run_date || '',
   }
 }
 
-function configFromForm(f, needsPeriod) {
+function configFromForm(f, needsPeriod, needsKeys) {
   const cfg = {
     target_table: f.target_table.trim(),
     load_strategy: f.load_strategy,
@@ -41,6 +42,7 @@ function configFromForm(f, needsPeriod) {
   if (f.date_column) cfg.date_column = f.date_column
   if (f.date_format.trim()) cfg.date_format = f.date_format.trim()
   if (f.restrict_col) cfg.restrict_col = f.restrict_col
+  if (needsKeys && f.key_columns.length) cfg.key_columns = f.key_columns
   if (needsPeriod || f.use_period) cfg.period_rule = { unit: 'month', cutover_day: Number(f.cutover_day) || 25 }
   const audit = {}
   if (f.audit_file_name.trim()) audit.file_name = f.audit_file_name.trim()
@@ -50,7 +52,7 @@ function configFromForm(f, needsPeriod) {
   return cfg
 }
 
-const STRATEGY_BADGE = { replace_period: 'Replace period', truncate_load: 'Truncate & load', append: 'Append' }
+const STRATEGY_BADGE = { replace_period: 'Replace period', truncate_load: 'Truncate & load', append: 'Append', upsert: 'Update or add' }
 
 export default function AdminPortalsTab({ user, portals, strategies, loading, onChanged, onManageUsers }) {
   const [selected, setSelected] = useState(null)   // portal id | 'new' | null
@@ -94,6 +96,7 @@ export default function AdminPortalsTab({ user, portals, strategies, loading, on
 
   const strategyInfo = strategies.find(s => s.id === form?.load_strategy)
   const needsPeriod = strategyInfo ? strategyInfo.needs_period : form?.load_strategy === 'replace_period'
+  const needsKeys = strategyInfo ? !!strategyInfo.needs_keys : form?.load_strategy === 'upsert'
   const columnKeys = useMemo(
     () => (form?.columns || []).map(c => c.key.trim().toUpperCase()).filter(Boolean),
     [form?.columns],
@@ -104,7 +107,7 @@ export default function AdminPortalsTab({ user, portals, strategies, loading, on
   const save = async () => {
     setSaving(true); setError(''); setNotice('')
     try {
-      const config = configFromForm(form, needsPeriod)
+      const config = configFromForm(form, needsPeriod, needsKeys)
       if (isNew) {
         await adminApi(user, '/admin/portals', {
           method: 'POST', body: { id: form.id.trim(), name: form.name, description: form.description, config },
@@ -202,6 +205,23 @@ export default function AdminPortalsTab({ user, portals, strategies, loading, on
                   </select>
                 </label>
                 {strategyInfo && <div className="ad-hint ad-span2">{strategyInfo.summary}</div>}
+
+                {needsKeys && (
+                  <div className="ad-span2">
+                    <div className="ad-sub">Key columns — rows with the same values in all of these are replaced</div>
+                    <div className="ad-checkrow">
+                      {columnKeys.map(k => (
+                        <label key={k} className="ad-check">
+                          <input type="checkbox" checked={form.key_columns.includes(k)}
+                                 onChange={e => set({ key_columns: e.target.checked
+                                   ? [...form.key_columns, k] : form.key_columns.filter(x => x !== k) })} />
+                          {k}
+                        </label>
+                      ))}
+                    </div>
+                    <span className="ad-hint">e.g. STORE_CODE and BRAND. With a brand restriction, the restriction column must be one of them.</span>
+                  </div>
+                )}
 
                 {(needsPeriod || form.use_period) && (
                   <label>Cutover day of month

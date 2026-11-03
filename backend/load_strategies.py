@@ -12,11 +12,14 @@ rows. A portal can replace that pre-insert step entirely with a
                   then insert. Monthly targets.
   truncate_load   Empty the table, then insert. Store master.
   append          Insert only; never deletes. Sales data.
+  upsert          Replace the rows whose key (e.g. STORE_CODE + BRAND) is in the
+                  file, insert the rest. Status masters.
 """
 
 REPLACE_PERIOD = "replace_period"
 TRUNCATE_LOAD = "truncate_load"
 APPEND = "append"
+UPSERT = "upsert"
 
 DEFAULT_STRATEGY = REPLACE_PERIOD
 
@@ -36,6 +39,13 @@ STRATEGIES = {
         "label": "Append",
         "needs_period": False,
         "summary": "Inserts the file's rows after the existing rows. Nothing is deleted.",
+    },
+    UPSERT: {
+        "label": "Update or add (by key)",
+        "needs_period": False,
+        "needs_keys": True,
+        "summary": "For each row in the file, replaces the existing row with the same key columns; "
+                   "rows whose key is not in the table yet are added. Other rows are left alone.",
     },
 }
 
@@ -60,15 +70,36 @@ def check_allowed(strategy: str, restrict_values) -> None:
         )
 
 
+# Parameters per DELETE statement for the direct (unstaged) upsert; the driver's cap is 2100.
+_DELETE_PARAM_BUDGET = 1600
+
+
+def _delete_keys_direct(cursor, table: str, key_cols: list, key_values: list) -> int:
+    per = max(1, _DELETE_PARAM_BUDGET // len(key_cols))
+    one = "(" + " AND ".join(f"[{c}] = ?" for c in key_cols) + ")"
+    removed = 0
+    for start in range(0, len(key_values), per):
+        chunk = key_values[start:start + per]
+        cursor.execute(f"DELETE FROM {table} WHERE " + " OR ".join([one] * len(chunk)),
+                       [v for kv in chunk for v in kv])
+        removed += cursor.rowcount if (cursor.rowcount or 0) > 0 else 0
+    return removed
+
+
 def prepare_target(strategy: str, cursor, config: dict, period: "dict | None", brands: list,
-                   transactional: bool = False) -> int:
+                   transactional: bool = False, key_values: "list | None" = None,
+                   stage: "tuple | None" = None) -> int:
     """Run the strategy's pre-insert step. Returns the number of existing
     rows removed (0 for append).
 
     `transactional=True` is the staged swap: everything here runs inside the
     swap transaction, so truncate_load uses a plain DELETE (which rolls back
     with the rest) instead of TRUNCATE (whose behaviour inside a transaction
-    on Fabric isn't something we can count on)."""
+    on Fabric isn't something we can count on).
+
+    upsert needs `key_values` (one tuple per file row, in key_columns order).
+    When the rows already sit in a staging table, `stage=(staging_table,
+    upload_id)` lets the database match them itself instead of sending keys."""
     table = config["target_table"]
 
     if strategy == APPEND:
@@ -83,6 +114,21 @@ def prepare_target(strategy: str, cursor, config: dict, period: "dict | None", b
         existing = int(cursor.fetchone()[0])
         cursor.execute(f"TRUNCATE TABLE {table}")
         return existing
+
+    if strategy == UPSERT:
+        key_cols = config.get("key_columns") or []
+        if not key_cols:
+            raise ValueError("upsert needs key_columns.")
+        if stage:
+            staging, upload_id = stage
+            match = " AND ".join(f"s.[{c}] = {table}.[{c}]" for c in key_cols)
+            cursor.execute(
+                f"DELETE FROM {table} WHERE EXISTS (SELECT 1 FROM {staging} s WHERE s.[UPLOAD_ID] = ? AND {match})",
+                [upload_id])
+            return cursor.rowcount if (cursor.rowcount or 0) > 0 else 0
+        if key_values is None:
+            raise ValueError("upsert needs the file's key values.")
+        return _delete_keys_direct(cursor, table, key_cols, key_values)
 
     if strategy == REPLACE_PERIOD:
         date_col = config.get("date_column")

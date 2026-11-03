@@ -433,6 +433,19 @@ def _build_upload_rows(df, config: dict, restrict_values):
                     f"File contains {restrict_col} value(s) you are not permitted to upload: {', '.join(disallowed)}"
                 )
 
+    key_cols = config.get('key_columns') or []
+    if load_strategies.strategy_of(config) == load_strategies.UPSERT and key_cols:
+        kv = work[key_cols]
+        blank = sum(1 for r in kv.values.tolist() if any(v is None or v == '' for v in r))
+        if blank:
+            raise ValueError(f"{blank} row(s) have an empty {' / '.join(key_cols)} value. "
+                             "Every row needs all of these to be matched. Fix the file and re-upload.")
+        dup = kv[kv.duplicated(keep=False)]
+        if len(dup):
+            ex = ', '.join('/'.join(map(str, r)) for r in dup.drop_duplicates().head(3).values.tolist())
+            raise ValueError(f"{len(dup)} row(s) repeat the same {' + '.join(key_cols)} (e.g. {ex}). "
+                             "Each combination may appear only once. Fix the file and re-upload.")
+
     rows = work[keys].values.tolist()
     preview = [
         {k: (v.isoformat() if isinstance(v, date) else v) for k, v in zip(keys, r)}
@@ -819,7 +832,8 @@ def admin_strategies():
     err = _require_admin()
     if err: return err
     return jsonify({"strategies": [
-        {"id": k, "label": v["label"], "summary": v["summary"], "needs_period": v["needs_period"]}
+        {"id": k, "label": v["label"], "summary": v["summary"], "needs_period": v["needs_period"],
+         "needs_keys": bool(v.get("needs_keys"))}
         for k, v in load_strategies.STRATEGIES.items()
     ]})
 
@@ -1171,6 +1185,7 @@ def get_upload_template():
             "date_column":  config.get('date_column'),
             "date_format":  config.get('date_format'),
             "restrict_col": config.get('restrict_col'),
+            "key_columns":  config.get('key_columns') or [],
             "load_strategy": load_strategies.strategy_of(config),
             "staged":       bool(config.get('staging_table')),
             "busy":         _busy_view(portal_id, request.args.get('email', '')),

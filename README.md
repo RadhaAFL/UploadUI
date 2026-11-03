@@ -69,7 +69,7 @@ Upload_Portal/
 
   backend/
     app.py                     # Flask API: auth, portal admin, upload validation, Fabric writes
-    load_strategies.py         # replace_period / truncate_load / append
+    load_strategies.py         # replace_period / truncate_load / append / upsert
     portal_config.py           # Validates admin-submitted portal configs (SQL identifiers!)
     portal_hooks.py            # Loads backend/portals/<id>.py hooks
     publisher.py               # Staged publish (stage -> verify -> one-transaction swap) + direct fallback
@@ -192,6 +192,7 @@ table. The strategy runs at commit time, right before the bulk insert.
 |---|---|---|
 | `replace_period` | Deletes rows in the upload period (and the brands in the file), then inserts. Needs `period_rule` + `date_column`. | Monthly targets |
 | `truncate_load` | `TRUNCATE TABLE`, then inserts. Blocked for users with a brand restriction, since it wipes every brand's rows. | Store master |
+| `upsert` | Deletes the rows whose `key_columns` (e.g. `STORE_CODE` + `BRAND`) appear in the file, then inserts the file: matches are replaced, new keys are added, everything else is left alone. A file that repeats a key, or has a blank key value, is rejected. With a brand restriction, the restriction column must be one of the keys. | Store status masters |
 | `append` | Inserts only. Never deletes. | Sales data |
 
 Portals saved before strategies existed have no `load_strategy` and behave as

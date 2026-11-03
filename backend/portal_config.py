@@ -121,6 +121,25 @@ def validate_portal_config(config) -> dict:
         if not date_col:
             errors.append(f"{strategy} needs a date_column to know which rows to replace.")
 
+    # ── key columns (what identifies a row, for upsert) ──
+    key_cols = []
+    raw_keys = config.get("key_columns")
+    if raw_keys:
+        key_cols = [_text(k, 64).upper() for k in raw_keys] if isinstance(raw_keys, list) else []
+        bad = [k for k in key_cols if k not in keys]
+        if not key_cols or bad or len(set(key_cols)) != len(key_cols):
+            errors.append("key_columns must be distinct columns of this portal"
+                          + (f" ({', '.join(bad)} not found)." if bad else "."))
+            key_cols = []
+        else:
+            out["key_columns"] = key_cols
+    if load_strategies.STRATEGIES.get(strategy, {}).get("needs_keys"):
+        if not key_cols:
+            errors.append(f"{strategy} needs key_columns (the columns that identify a row, e.g. STORE_CODE and BRAND).")
+        elif restrict_col and restrict_col not in key_cols:
+            errors.append(f"{strategy} with a restriction column needs {restrict_col} in key_columns, so a restricted "
+                          "user can only replace their own rows.")
+
     # ── audit columns (stamped on every inserted row) ──
     audit_in = config.get("audit_columns")
     if audit_in:

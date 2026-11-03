@@ -131,6 +131,15 @@ def bulk_insert(cursor, table: str, columns: list, rows: list, progress=None):
             progress(min(start + per, total), total)
 
 
+def _key_values(staged) -> "list | None":
+    """The key-column values of every file row (distinct), for an upsert."""
+    key_cols = staged["config"].get("key_columns")
+    if not key_cols:
+        return None
+    idx = [staged["columns"].index(c) for c in key_cols]
+    return list({tuple(row[i] for i in idx) for row in staged["rows"]})
+
+
 def _direct(connect, staged, progress):
     config, rows = staged["config"], staged["rows"]
     table = config["target_table"]
@@ -141,7 +150,8 @@ def _direct(connect, staged, progress):
         removed = portal_hooks.run_before_insert(staged["portal_id"], cursor, _hook_ctx(staged))
         if removed is None:
             removed = load_strategies.prepare_target(
-                staged["load_strategy"], cursor, config, staged["period"], staged["brands_in_file"])
+                staged["load_strategy"], cursor, config, staged["period"], staged["brands_in_file"],
+                key_values=_key_values(staged))
         touched = True
         bulk_insert(cursor, table, staged["columns"], rows, progress)
     except PublishError:
@@ -250,7 +260,7 @@ def swap(connect, staged, upload_id: str) -> dict:
         if removed is None:
             removed = load_strategies.prepare_target(
                 staged["load_strategy"], cursor, config, staged["period"], staged["brands_in_file"],
-                transactional=True)
+                transactional=True, stage=(staging, upload_id))
         cursor.execute(
             f"INSERT INTO {target} ({col_sql}) SELECT {col_sql} FROM {staging} WHERE [UPLOAD_ID] = ?", [upload_id])
         inserted = cursor.rowcount

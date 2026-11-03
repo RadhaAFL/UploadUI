@@ -20,6 +20,7 @@ function restrictionText(vals) {
 function loadRuleText(strategy, table, period, brands) {
   if (strategy === 'truncate_load') return `This replaces ALL existing data in ${table} with your file.`
   if (strategy === 'append') return `This adds your rows to the existing data in ${table}. Nothing is deleted.`
+  if (strategy === 'upsert') return `This updates rows in ${table} that match your file, and adds the rest. Other rows are not touched.`
   const brandPart = brands?.length ? ` for ${brands.join(', ')}` : ''
   return `This replaces existing ${period?.label || 'matching'} data${brandPart} with your file.`
 }

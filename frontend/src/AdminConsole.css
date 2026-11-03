@@ -274,6 +274,8 @@
 .ad-editor input:disabled { background: #f2f4f7; color: #667085; }
 
 .ad-check { display: flex !important; align-items: center; gap: 8px !important; grid-column: span 2; }
+.ad-checkrow { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 6px 0; }
+.ad-checkrow .ad-check { grid-column: auto; }
 
 .ad-hint { font-size: 12px; font-weight: 400; color: #667085; line-height: 1.45; }
 .ad-muted { font-size: 12px; color: #667085; }
