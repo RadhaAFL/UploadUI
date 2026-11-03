@@ -29,6 +29,7 @@ import duckdb
 import load_strategies
 import portal_config
 import portal_hooks
+import publisher
 
 app = Flask(__name__)
 CORS(app)
@@ -146,6 +147,27 @@ def init_db():
             email            VARCHAR,
             restrict_values  VARCHAR,
             PRIMARY KEY (portal_id, email)
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS upload_jobs (
+            id            VARCHAR PRIMARY KEY,
+            portal_id     VARCHAR,
+            email         VARCHAR,
+            filename      VARCHAR,
+            mode          VARCHAR,
+            state         VARCHAR,
+            rows_total    INTEGER,
+            rows_done     INTEGER,
+            deleted       INTEGER,
+            inserted      INTEGER,
+            verified      INTEGER,
+            message       VARCHAR,
+            live_changed  VARCHAR,
+            period_label  VARCHAR,
+            brands        VARCHAR,
+            started_at    TIMESTAMP,
+            finished_at   TIMESTAMP
         )
     """)
 
@@ -434,33 +456,150 @@ def _upload_insert_columns(config: dict):
     return cols + audit_cols, cols, audit_cols
 
 
-def _bulk_insert_rows(cursor, table: str, columns: list, rows: list, batch_size: int = 150):
-    """Insert rows via multi-row VALUES batches.
+# ── Upload jobs: the publish to Fabric runs in the background ──────────────
+# The browser only starts a job and polls it, so a closed tab or a dropped
+# connection to the browser can't interrupt a load half-way. One job per
+# portal at a time (this app runs a single gunicorn worker — see README — so
+# an in-process lock is enough).
 
-    cursor.executemany() with fast_executemany=True was measured against
-    Fabric's ODBC endpoint at ~3-7 rows/sec — no faster than a plain
-    per-row loop, meaning the driver silently isn't getting a server-side
-    bulk-RPC speedup through this path (a known pyodbc/driver-combination
-    gap, not something Python can detect ahead of time). A single
-    multi-row INSERT statement per batch sidesteps that entirely: it's one
-    network round trip per `batch_size` rows regardless of what the driver
-    does internally. SQL Server caps a statement at 2100 parameters;
-    batch_size is kept well under that for any reasonable column count.
-    """
-    if not rows:
-        return
-    col_sql = ', '.join(f'[{c}]' for c in columns)
-    n_cols = len(columns)
-    total = len(rows)
-    inserted = 0
-    for i in range(0, total, batch_size):
-        chunk = rows[i:i + batch_size]
-        placeholders = ', '.join('(' + ', '.join(['?'] * n_cols) + ')' for _ in chunk)
-        params = [v for row in chunk for v in row]
-        cursor.execute(f"INSERT INTO {table} ({col_sql}) VALUES {placeholders}", params)
-        inserted += len(chunk)
-        if inserted % (batch_size * 20) == 0 or inserted == total:
-            print(f"Upload commit: inserted {inserted}/{total} rows into {table}", flush=True)
+_busy_lock = threading.Lock()
+_portal_busy: dict = {}          # portal_id -> {"job_id", "email", "since"}
+
+_JOB_FIELDS = ("state", "rows_total", "rows_done", "deleted", "inserted", "verified",
+               "message", "live_changed", "finished_at")
+_JOB_SELECT = ("id, portal_id, email, filename, mode, state, rows_total, rows_done, deleted, inserted, "
+               "verified, message, live_changed, period_label, brands, started_at, finished_at")
+
+
+def _job_dict(r) -> dict:
+    return {
+        "job_id": r[0], "portal_id": r[1], "email": r[2], "filename": r[3], "mode": r[4], "state": r[5],
+        "rows_total": r[6], "rows_done": r[7], "deleted": r[8], "inserted": r[9], "verified": r[10],
+        "message": r[11], "live_changed": r[12], "period_label": r[13],
+        "brands": json.loads(r[14]) if r[14] else [],
+        "started_at": str(r[15]) if r[15] else None, "finished_at": str(r[16]) if r[16] else None,
+        "finished": r[5] in ('done', 'failed'),
+    }
+
+
+def _update_job(job_id: str, **fields):
+    bad = set(fields) - set(_JOB_FIELDS)
+    if bad:
+        raise ValueError(f"unknown job field(s): {sorted(bad)}")
+    sets = ', '.join(f"{k}=?" for k in fields)
+    with _db_lock:
+        get_con().execute(f"UPDATE upload_jobs SET {sets} WHERE id=?", [*fields.values(), job_id])
+
+
+def _get_job(job_id: str):
+    with _db_lock:
+        row = get_con().execute(f"SELECT {_JOB_SELECT} FROM upload_jobs WHERE id=?", [job_id]).fetchone()
+    return _job_dict(row) if row else None
+
+
+def _utcnow_str() -> str:
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _try_acquire_portal(portal_id: str, job_id: str, email: str):
+    """Claim the portal for a job. Returns None if claimed, else the holder."""
+    with _busy_lock:
+        holder = _portal_busy.get(portal_id)
+        if holder:
+            return dict(holder)
+        _portal_busy[portal_id] = {"job_id": job_id, "email": email, "since": time.time()}
+        return None
+
+
+def _release_portal(portal_id: str, job_id: str):
+    with _busy_lock:
+        if (_portal_busy.get(portal_id) or {}).get("job_id") == job_id:
+            _portal_busy.pop(portal_id, None)
+
+
+def _busy_view(portal_id: str, email: str = ''):
+    """Who holds the portal right now, shaped for the UI; None if free."""
+    with _busy_lock:
+        holder = _portal_busy.get(portal_id)
+        holder = dict(holder) if holder else None
+    if not holder:
+        return None
+    minutes = max(0, int((time.time() - holder["since"]) // 60))
+    mine = bool(email) and holder["email"] == email.strip().lower()
+    ago = "less than a minute ago" if minutes < 1 else f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    message = (f"You already have an upload running for this portal (started {ago})." if mine else
+               f"{holder['email']} is uploading to this portal right now (started {ago}). "
+               "Please try again in a few minutes.")
+    return {"job_id": holder["job_id"], "by": holder["email"], "mine": mine, "minutes": minutes, "message": message}
+
+
+def _run_upload_job(job_id: str, staged: dict):
+    """Thread body: publish one validated upload and record what happened."""
+    portal_id, email = staged['portal_id'], staged['email']
+    total = len(staged['rows'])
+    last_write = [0.0]
+
+    def progress(done, _total):
+        now = time.time()
+        if done >= _total or now - last_write[0] >= 0.5:   # don't write the job row on every batch
+            last_write[0] = now
+            _update_job(job_id, rows_done=int(done))
+
+    def set_state(state):
+        _update_job(job_id, state=state, rows_done=total if state == 'publishing' and staged['config'].get('staging_table') else 0)
+
+    try:
+        result = publisher.publish(_fab_conn, staged, progress=progress, set_state=set_state)
+        verified = publisher.verify_loaded(_fab_conn, staged)
+        _update_job(job_id, state='done', rows_done=total, deleted=int(result['deleted'] or 0),
+                    inserted=int(result['inserted']), verified=verified, live_changed='yes', finished_at=_utcnow_str())
+        _audit(email, 'upload_commit', {
+            "portal_id": portal_id, "strategy": staged['load_strategy'], "staged": result['staged'],
+            "deleted": int(result['deleted'] or 0), "inserted": int(result['inserted'])})
+    except publisher.PublishError as e:
+        live = {False: 'no', True: 'yes', None: 'unknown'}[e.live_changed]
+        _update_job(job_id, state='failed', message=e.message, live_changed=live, finished_at=_utcnow_str())
+        _audit(email, 'upload_failed', {"portal_id": portal_id, "live_changed": live, "error": e.message})
+    except Exception as e:
+        print("Upload job failed unexpectedly:", traceback.format_exc(), flush=True)
+        _update_job(job_id, state='failed', message=f"Unexpected error: {e}", live_changed='unknown',
+                    finished_at=_utcnow_str())
+        _audit(email, 'upload_failed', {"portal_id": portal_id, "live_changed": "unknown", "error": str(e)})
+    finally:
+        _release_portal(portal_id, job_id)
+
+
+def _sweep_interrupted_jobs():
+    """At start-up: a job still 'running' belongs to a process that died. Mark
+    it failed, saying what state the live table is in, and clear its staging rows."""
+    with _db_lock:
+        con = get_con()
+        orphans = con.execute(
+            "SELECT id, portal_id, state FROM upload_jobs WHERE state NOT IN ('done','failed')").fetchall()
+        for job_id, _pid, state in orphans:
+            if state == 'staging':
+                msg, live = ("The server restarted while this upload was loading. The live table was not changed — "
+                             "please upload the file again."), 'no'
+            else:
+                msg, live = ("The server restarted while this upload was being applied. Check the table before "
+                             "uploading again."), 'unknown'
+            con.execute("UPDATE upload_jobs SET state='failed', message=?, live_changed=?, finished_at=? WHERE id=?",
+                        [msg, live, _utcnow_str(), job_id])
+    staging_orphans = []
+    for job_id, portal_id, state in orphans:
+        if state != 'staging':
+            continue
+        with _db_lock:
+            row = get_con().execute("SELECT config FROM portals WHERE id=?", [portal_id]).fetchone()
+        table = (json.loads(row[0]).get('staging_table') if row else None)
+        if table:
+            staging_orphans.append((table, job_id))
+    if staging_orphans and _FAB_HOST:
+        def clean():
+            for table, job_id in staging_orphans:
+                publisher.discard_staged(_fab_conn, table, job_id)
+        threading.Thread(target=clean, daemon=True, name="staging-cleanup").start()
+    return len(orphans)
 
 
 def _cleanup_expired_uploads():
@@ -576,6 +715,7 @@ def _portal_admin_view(row, access_count: int) -> dict:
         "id": portal_id, "name": row[1], "description": row[2], "config": config,
         "created_at": str(row[4]), "is_active": bool(row[5]),
         "load_strategy": load_strategies.strategy_of(config),
+        "staged": bool(config.get('staging_table')),
         "access_count": access_count,
         "hook_file": f"backend/portals/{portal_id}.py",
         "has_hooks": portal_hooks.has_hooks(portal_id),
@@ -814,6 +954,117 @@ def admin_remove_access(portal_id):
         return jsonify({"error": str(e)}), 500
 
 
+# ── Admin: staging table set-up ────────────────────────────────────────────
+
+_FABRIC_COLUMNS_SQL = (
+    "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION "
+    "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION")
+
+
+def _load_portal_config_any(portal_id: str) -> dict:
+    """A portal's config whether or not it is active (admin screens need both)."""
+    with _db_lock:
+        row = get_con().execute("SELECT config FROM portals WHERE id=?", [portal_id]).fetchone()
+    if not row:
+        raise ValueError(f"Portal not found: {portal_id}")
+    return json.loads(row[0])
+
+
+def _fabric_columns(cursor, table: str) -> list:
+    schema, name = publisher.split_table(table)
+    cursor.execute(_FABRIC_COLUMNS_SQL, [schema, name])
+    return [tuple(r) for r in cursor.fetchall()]
+
+
+def _staging_plan(config: dict) -> dict:
+    """Inspect Fabric and work out what the portal's staging table needs.
+    Raises on a connection failure."""
+    target = config['target_table']
+    suggested = f"stg.{publisher.split_table(target)[1]}"
+    name = config.get('staging_table') or suggested
+    loaded_cols = _upload_insert_columns(config)[0]
+    conn = _fab_conn()
+    try:
+        cur = conn.cursor()
+        target_meta = _fabric_columns(cur, target)
+        staging_meta = _fabric_columns(cur, name)
+        cur.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME=?",
+                    [publisher.split_table(name)[0]])
+        schema_exists = int(cur.fetchone()[0]) > 0
+    finally:
+        conn.close()
+
+    plan = {"staging_table": name, "configured": bool(config.get('staging_table')), "suggested": suggested,
+            "target_found": bool(target_meta), "staging_exists": bool(staging_meta),
+            "schema_exists": schema_exists, "missing_columns": [], "statements": []}
+    if staging_meta:
+        have = {str(m[0]).upper() for m in staging_meta}
+        plan["missing_columns"] = [c for c in loaded_cols + publisher.STAGE_META_COLUMNS if c.upper() not in have]
+    elif target_meta:
+        try:
+            ddl = publisher.build_staging_ddl(name, target_meta, loaded_cols)
+            plan["statements"] = ([] if schema_exists else [f"CREATE SCHEMA {publisher.split_table(name)[0]}"]) + [ddl]
+        except ValueError as e:
+            plan["ddl_error"] = str(e)
+    return plan
+
+
+@app.route('/admin/portals/<portal_id>/staging', methods=['GET'])
+def admin_staging_status(portal_id):
+    """What the portal's staging table looks like in Fabric right now, and the
+    DDL that would create it. Read-only."""
+    err = _require_admin()
+    if err: return err
+    try:
+        config = _load_portal_config_any(portal_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    try:
+        return jsonify(_staging_plan(config))
+    except Exception as e:
+        return jsonify({"fabric_error": str(e), "configured": bool(config.get('staging_table')),
+                        "staging_table": config.get('staging_table')})
+
+
+@app.route('/admin/portals/<portal_id>/staging', methods=['POST'])
+def admin_create_staging(portal_id):
+    """Create the portal's staging table (and its schema if missing) using the
+    app's own Fabric login. Needs the table name saved on the portal first."""
+    err = _require_admin()
+    if err: return err
+    try:
+        config = _load_portal_config_any(portal_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    if not config.get('staging_table'):
+        return jsonify({"error": "Save a staging table name on the portal first."}), 400
+    caller = str((request.get_json(silent=True) or {}).get('caller_email', '')).strip().lower()
+    try:
+        plan = _staging_plan(config)
+    except Exception as e:
+        return jsonify({"error": f"Could not reach Fabric: {e}"}), 502
+    if plan["staging_exists"]:
+        return jsonify({"error": f"{plan['staging_table']} already exists.", **plan}), 409
+    if not plan["target_found"]:
+        return jsonify({"error": f"Could not find the live table {config['target_table']} in Fabric."}), 400
+    if plan.get("ddl_error"):
+        return jsonify({"error": plan["ddl_error"]}), 400
+    conn = None
+    try:
+        conn = _fab_conn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        for stmt in plan["statements"]:
+            cur.execute(stmt)
+    except Exception as e:
+        return jsonify({"error": f"Fabric refused the statement: {e}", "statements": plan["statements"]}), 500
+    finally:
+        if conn is not None:
+            conn.close()
+    _audit(caller, 'staging_create', {"portal_id": portal_id, "staging_table": plan["staging_table"]})
+    return jsonify({"status": "created", "statements": plan["statements"], "staging_table": plan["staging_table"]})
+
+
 # ── Sample template download (Phase 1) ─────────────────────────────────────
 
 def _example_value(col: dict, config: dict, period: "dict | None") -> str:
@@ -921,6 +1172,8 @@ def get_upload_template():
             "date_format":  config.get('date_format'),
             "restrict_col": config.get('restrict_col'),
             "load_strategy": load_strategies.strategy_of(config),
+            "staged":       bool(config.get('staging_table')),
+            "busy":         _busy_view(portal_id, request.args.get('email', '')),
             "period_rule":  config.get('period_rule'),
             "period":       _period_for_rule(config.get('period_rule')),
         })
@@ -952,6 +1205,10 @@ def start_upload():
         if not _valid_view_name(config.get('target_table', '')):
             return jsonify({"error": "Portal target_table is misconfigured"}), 500
 
+        busy = _busy_view(portal_id, email)
+        if busy:   # say so before they wait on a file that can't be published yet
+            return jsonify({"error": busy["message"], "busy": busy}), 409
+
         restrict_col = config.get('restrict_col')
         restrict_values = _load_user_restrict_values(portal_id, email, restrict_col) if restrict_col else None
         strategy = load_strategies.strategy_of(config)
@@ -965,6 +1222,9 @@ def start_upload():
         }
         df = portal_hooks.run_prepare(portal_id, df, hook_ctx)
         result = _build_upload_rows(df, config, restrict_values)
+        if not result['row_count']:
+            # An empty file would still delete the period/table under replace_period or truncate_load.
+            raise ValueError("The file has no data rows, so there is nothing to upload.")
 
         load_run_date = datetime.utcnow().strftime('%Y%m%d%H%M%S')
         run_date_str = date.today().isoformat()
@@ -1000,6 +1260,7 @@ def start_upload():
             "upload_id":  upload_id,
             "filename":   filename,
             "load_strategy": strategy,
+            "staged":     bool(config.get('staging_table')),
             "row_count":  result['row_count'],
             "brands_in_file": result['brands_in_file'],
             "period":     result['period'],
@@ -1015,8 +1276,11 @@ def start_upload():
 
 @app.route('/upload/commit', methods=['POST'])
 def commit_upload():
-    """Commit a previously validated upload: delete existing rows for the
-    same period + brand(s), then bulk-insert the staged rows into Fabric."""
+    """Start publishing a previously validated upload. Returns 202 at once with
+    a job id; the load runs in the background (see publisher.py) and the page
+    polls /upload/status. Only one upload per portal runs at a time — a second
+    one gets a 409 and its validated file is kept, so Confirm can be pressed
+    again once the portal is free."""
     try:
         body = request.get_json() or {}
         upload_id = str(body.get('upload_id', '')).strip()
@@ -1025,70 +1289,73 @@ def commit_upload():
             return jsonify({"error": "upload_id is required"}), 400
 
         with _upload_lock:
-            staged = _upload_staging.pop(upload_id, None)
+            staged = _upload_staging.get(upload_id)
         if not staged or (time.time() - staged.get('created_at', 0) > UPLOAD_SESSION_TTL_SECONDS):
             return jsonify({"error": "Upload session expired or not found. Please re-upload the file."}), 404
         if email and staged['email'] != email:
             return jsonify({"error": "This upload session belongs to a different user."}), 403
 
+        portal_id = staged['portal_id']
+        holder = _try_acquire_portal(portal_id, upload_id, staged['email'])
+        if holder:
+            view = _busy_view(portal_id, staged['email']) or {
+                "message": "Another upload to this portal is in progress. Please try again in a few minutes."}
+            return jsonify({"error": view["message"], "busy": view}), 409
+
+        with _upload_lock:
+            staged = _upload_staging.pop(upload_id, None)
+        if staged is None:     # a double-click got there first
+            _release_portal(portal_id, upload_id)
+            return jsonify({"error": "This upload was already submitted."}), 409
+
         config = staged['config']
-        table = config['target_table']
+        staged['upload_id'] = upload_id
+        staged['load_strategy'] = staged.get('load_strategy') or load_strategies.strategy_of(config)
+        mode = 'staged' if config.get('staging_table') else 'direct'
         period = staged['period']
-        brands = staged['brands_in_file']
-        strategy = staged.get('load_strategy') or load_strategies.strategy_of(config)
-
-        conn = None
         try:
-            conn = _fab_conn()
-            conn.autocommit = True
-            cursor = conn.cursor()
+            with _db_lock:
+                get_con().execute(
+                    "INSERT INTO upload_jobs (id, portal_id, email, filename, mode, state, rows_total, rows_done, "
+                    "period_label, brands, started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    [upload_id, portal_id, staged['email'], staged.get('filename'), mode, 'starting',
+                     len(staged['rows']), 0, (period or {}).get('label'),
+                     json.dumps(staged['brands_in_file']), _utcnow_str()])
+            threading.Thread(target=_run_upload_job, args=(upload_id, staged), daemon=True,
+                             name=f"upload-{upload_id[:8]}").start()
+        except Exception:
+            _release_portal(portal_id, upload_id)
+            raise
 
-            # A portal hook's before_insert() replaces the built-in strategy's
-            # delete/truncate step; without one the configured strategy runs.
-            hook_ctx = {
-                "portal_id": staged['portal_id'], "config": config, "email": staged['email'],
-                "filename": staged.get('filename'), "period": period,
-                "restrict_values": staged.get('restrict_values'), "table": table, "brands": brands,
-            }
-            deleted = portal_hooks.run_before_insert(staged['portal_id'], cursor, hook_ctx)
-            if deleted is None:
-                deleted = load_strategies.prepare_target(strategy, cursor, config, period, brands)
-
-            _bulk_insert_rows(cursor, table, staged['columns'], staged['rows'])
-
-            verified = len(staged['rows'])
-            load_run_col = (config.get('audit_columns') or {}).get('load_run_date')
-            if load_run_col:
-                cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE [{load_run_col}]=?", [staged['load_run_date']])
-                verified = int(cursor.fetchone()[0])
-        finally:
-            if conn is not None:
-                conn.close()
-
-        with _db_lock:
-            next_id = get_con().execute("SELECT COALESCE(MAX(id),0)+1 FROM audit_logs").fetchone()[0]
-            get_con().execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?)", [
-                next_id, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), email, '', 'upload_commit',
-                json.dumps({"portal_id": staged['portal_id'], "strategy": strategy,
-                            "deleted": deleted, "inserted": len(staged['rows'])}),
-            ])
-
-        return jsonify({
-            "status":    "ok",
-            "load_strategy": strategy,
-            "deleted":   deleted,
-            "inserted":  len(staged['rows']),
-            "verified":  verified,
-            "period":    period,
-            "brands":    brands,
-            "table":     table,
-        })
+        return jsonify({"status": "started", "job_id": upload_id, "mode": mode,
+                        "rows_total": len(staged['rows'])}), 202
     except Exception as e:
-        print("Upload commit failed:", traceback.format_exc(), flush=True)
-        return jsonify({
-            "error": str(e),
-            "hint": "Check Fabric schema/table name, INSERT/DELETE permission, and ODBC credentials.",
-        }), 500
+        print("Upload commit failed to start:", traceback.format_exc(), flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/upload/status', methods=['GET'])
+def upload_status():
+    """Progress / outcome of an upload job. Visible to the user who started it
+    and to admins."""
+    try:
+        job_id = request.args.get('job_id', '').strip()
+        email = request.args.get('email', '').strip().lower()
+        job = _get_job(job_id) if job_id else None
+        if not job:
+            return jsonify({"error": "Upload not found."}), 404
+        if job['email'] != email and not _is_admin(email):
+            return jsonify({"error": "This upload belongs to a different user."}), 403
+        job['load_strategy'] = None
+        with _db_lock:
+            row = get_con().execute("SELECT config FROM portals WHERE id=?", [job['portal_id']]).fetchone()
+        if row:
+            cfg = json.loads(row[0])
+            job['load_strategy'] = load_strategies.strategy_of(cfg)
+            job['table'] = cfg.get('target_table')
+        return jsonify(job)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Audit log endpoints ───────────────────────────────────────────────────
@@ -1113,6 +1380,7 @@ def insert_log():
 
 
 init_db()
+_sweep_interrupted_jobs()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5003)

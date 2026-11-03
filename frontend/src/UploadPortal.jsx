@@ -24,23 +24,51 @@ function loadRuleText(strategy, table, period, brands) {
   return `This replaces existing ${period?.label || 'matching'} data${brandPart} with your file.`
 }
 
+// Wording for the background upload's progress and outcome.
+function progressTitle(job) {
+  if (job.state === 'publishing' && job.mode === 'staged') return 'Applying your file to the live table…'
+  if (job.state === 'staging') return 'Loading your file into a staging area…'
+  if (job.state === 'starting') return 'Starting your upload…'
+  return 'Loading your file…'
+}
+
+function progressPercent(job) {
+  if (!job.rows_total) return 0
+  if (job.state === 'publishing' && job.mode === 'staged') return 100
+  return Math.min(100, Math.round(((job.rows_done || 0) / job.rows_total) * 100))
+}
+
+// What a user must know after a failure: is the live table safe?
+function liveChangedText(liveChanged) {
+  if (liveChanged === 'no') return 'Nothing in the live table was changed, so it is safe to try again.'
+  if (liveChanged === 'yes') return 'The live table may now hold only part of this file. Upload the file again to complete it.'
+  return "We couldn't confirm what happened to the live table. Please check it before uploading again."
+}
+
 export default function UploadPortal({ user, portal, onBack }) {
   const [template, setTemplate]   = useState(null)
   const [loading, setLoading]     = useState(true)
   const [error, setError]         = useState('')
   const [validating, setValidating] = useState(false)
   const [staged, setStaged]       = useState(null)   // response from /upload/start
-  const [committing, setCommitting] = useState(false)
-  const [result, setResult]       = useState(null)    // response from /upload/commit
+  const [committing, setCommitting] = useState(false)   // the request that starts the job
+  const [job, setJob]             = useState(null)    // the background upload: running, done or failed
+  const [linkLost, setLinkLost]   = useState(false)   // can't reach the server while polling
   const fileInputRef = useRef(null)
+
+  const statusUrl = id => `${API}/upload/status?job_id=${encodeURIComponent(id)}&email=${encodeURIComponent(user.email)}`
 
   const loadTemplate = () => {
     setLoading(true); setError('')
-    fetch(`${API}/upload-template?portal_id=${encodeURIComponent(portal.id)}`)
+    fetch(`${API}/upload-template?portal_id=${encodeURIComponent(portal.id)}&email=${encodeURIComponent(user.email)}`)
       .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
       .then(({ ok, data }) => {
         if (!ok) throw new Error(data.error || 'Could not load upload template')
         setTemplate(data)
+        // The user closed the page while their upload was running: pick it back up.
+        if (data.busy?.mine) {
+          fetch(statusUrl(data.busy.job_id)).then(r => r.json()).then(j => { if (j.job_id) setJob(j) }).catch(() => {})
+        }
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
@@ -48,15 +76,35 @@ export default function UploadPortal({ user, portal, onBack }) {
 
   useEffect(loadTemplate, [portal.id])
 
+  // While an upload runs on the server, ask how it is going. The load does not
+  // depend on this page: if the connection drops or the tab closes it carries on.
+  useEffect(() => {
+    if (!job || job.finished) return undefined
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const res = await fetch(statusUrl(job.job_id))
+        const data = await res.json()
+        if (cancelled) return
+        if (!res.ok) throw new Error(data.error || `Server error ${res.status}`)
+        setJob(data); setLinkLost(false)
+      } catch {
+        if (!cancelled) setLinkLost(true)
+      }
+    }
+    const timer = setInterval(tick, 1500)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [job?.job_id, job?.finished, user.email])
+
   const reset = () => {
-    setStaged(null); setResult(null); setError('')
+    setStaged(null); setJob(null); setLinkLost(false); setError('')
     if (fileInputRef.current) fileInputRef.current.value = ''
     loadTemplate() // refresh period in case day rolled over
   }
 
   const handleFile = async (file) => {
     if (!file) return
-    setValidating(true); setError(''); setStaged(null); setResult(null)
+    setValidating(true); setError(''); setStaged(null); setJob(null)
     try {
       const formData = new FormData()
       formData.append('file', file)
@@ -64,7 +112,10 @@ export default function UploadPortal({ user, portal, onBack }) {
       formData.append('email', user.email)
       const res = await fetch(`${API}/upload/start`, { method: 'POST', body: formData })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error || `Server error ${res.status}`)
+      if (!res.ok) {
+        if (res.status === 409) loadTemplate()   // someone else is uploading: show the banner too
+        throw new Error(data.error || `Server error ${res.status}`)
+      }
       setStaged(data)
       logEvent(user, 'upload_validate', {
         portal_id: portal.id, portal_name: portal.name, filename: data.filename,
@@ -77,6 +128,9 @@ export default function UploadPortal({ user, portal, onBack }) {
     }
   }
 
+  // Starts the upload on the server and returns straight away; the page then
+  // follows its progress. (The server records the commit itself, so nothing is
+  // logged from here.)
   const handleCommit = async () => {
     if (!staged) return
     setCommitting(true); setError('')
@@ -87,19 +141,19 @@ export default function UploadPortal({ user, portal, onBack }) {
         body: JSON.stringify({ upload_id: staged.upload_id, email: user.email }),
       })
       const data = await res.json()
+      if (res.status === 409) loadTemplate()   // portal busy: your validated file is kept, press Confirm again later
       if (!res.ok) throw new Error(data.error || `Server error ${res.status}`)
-      setResult(data)
+      setJob({ job_id: data.job_id, state: 'starting', mode: data.mode, rows_total: data.rows_total, rows_done: 0, finished: false })
       setStaged(null)
-      logEvent(user, 'upload_commit', {
-        portal_id: portal.id, portal_name: portal.name,
-        deleted: data.deleted, inserted: data.inserted, period: data.period?.key,
-      })
     } catch (e) {
       setError(e.message)
     } finally {
       setCommitting(false)
     }
   }
+
+  const running = !!job && !job.finished
+  const busyByOther = !!template?.busy && !template.busy.mine && !job
 
   const columns = template?.columns || []
   const period = template?.period
@@ -176,7 +230,15 @@ export default function UploadPortal({ user, portal, onBack }) {
               </div>
             </section>
 
-            {!result && (
+            {busyByOther && (
+              <section className="up-busy-card">
+                <div className="up-busy-title">⏳ Someone else is uploading to this portal</div>
+                <div className="up-busy-body">{template.busy.message}</div>
+                <button className="btn-outline" onClick={loadTemplate}>Check again</button>
+              </section>
+            )}
+
+            {!job && !busyByOther && (
               <section className="up-dropzone-card">
                 <input
                   ref={fileInputRef}
@@ -197,7 +259,7 @@ export default function UploadPortal({ user, portal, onBack }) {
               </section>
             )}
 
-            {staged && !result && (
+            {staged && !job && (
               <section className="up-preview-card">
                 <div className="up-preview-head">
                   <div>
@@ -245,18 +307,54 @@ export default function UploadPortal({ user, portal, onBack }) {
               </section>
             )}
 
-            {result && (
+            {running && (
+              <section className="up-progress-card">
+                <div className="up-progress-title"><span className="spinner up-spinner-dark" /> {progressTitle(job)}</div>
+                <div className="up-progress-bar" aria-label="Upload progress">
+                  <div className="up-progress-fill" style={{ width: `${progressPercent(job)}%` }} />
+                </div>
+                <div className="up-progress-meta">
+                  {job.rows_total ? `${(job.rows_done || 0).toLocaleString('en-IN')} of ${job.rows_total.toLocaleString('en-IN')} rows` : ''}
+                </div>
+                <div className="up-progress-note">
+                  {job.mode === 'staged'
+                    ? "Your live data is not changed until the whole file has loaded and checked out; then it is swapped in all at once."
+                    : "Please don't upload this file again while it is running."}
+                  {' '}You can close this page — the upload keeps running on the server, and you'll see the result when you come back.
+                </div>
+                {linkLost && (
+                  <div className="up-warning">
+                    Can't reach the server right now. Your upload is still running — trying again…
+                  </div>
+                )}
+              </section>
+            )}
+
+            {job?.state === 'done' && (
               <section className="up-result-card">
                 <div className="up-result-icon">✅</div>
                 <div className="up-result-title">Upload complete</div>
                 <div className="up-result-body">
-                  <strong>{result.inserted.toLocaleString('en-IN')}</strong> rows inserted
-                  {result.deleted > 0 && <> · <strong>{result.deleted.toLocaleString('en-IN')}</strong> existing rows {result.load_strategy === 'truncate_load' ? 'removed' : 'replaced'}</>}
-                  {result.period && <> for <strong>{result.period.label}</strong></>}
-                  {result.brands?.length > 0 && <> ({result.brands.join(', ')})</>}.
-                  {' '}Verified <strong>{result.verified.toLocaleString('en-IN')}</strong> rows in {result.table}.
+                  <strong>{(job.inserted ?? 0).toLocaleString('en-IN')}</strong> rows inserted
+                  {job.deleted > 0 && <> · <strong>{job.deleted.toLocaleString('en-IN')}</strong> existing rows {job.load_strategy === 'truncate_load' ? 'removed' : 'replaced'}</>}
+                  {job.period_label && <> for <strong>{job.period_label}</strong></>}
+                  {job.brands?.length > 0 && <> ({job.brands.join(', ')})</>}.
+                  {job.verified != null && <>{' '}Verified <strong>{job.verified.toLocaleString('en-IN')}</strong> rows in {job.table || template.target_table}.</>}
                 </div>
+                {job.mode === 'staged' && (
+                  <div className="up-result-sub">Checked in a staging area first, then swapped into the live table in one step.</div>
+                )}
                 <button className="btn-primary" onClick={reset}>Upload another file</button>
+              </section>
+            )}
+
+            {job?.state === 'failed' && (
+              <section className="up-failed-card">
+                <div className="up-result-icon">⚠️</div>
+                <div className="up-result-title">Upload did not complete</div>
+                <div className="up-result-body">{job.message}</div>
+                <div className={`up-failed-state up-failed-${job.live_changed || 'unknown'}`}>{liveChangedText(job.live_changed)}</div>
+                <button className="btn-primary" onClick={reset}>Start again</button>
               </section>
             )}
           </>

@@ -1,11 +1,11 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { adminApi } from './adminApi'
 
 const blankColumn = () => ({ key: '', label: '', numeric: false, example: '', description: '' })
 
 const emptyForm = () => ({
   id: '', name: '', description: '', is_active: true,
-  target_table: '', load_strategy: 'append', columns: [blankColumn()],
+  target_table: '', staging_table: '', load_strategy: 'append', columns: [blankColumn()],
   date_column: '', date_format: '', restrict_col: '',
   use_period: false, cutover_day: 25,
   audit_file_name: '', audit_run_date: '', audit_load_run_date: '',
@@ -16,7 +16,7 @@ function formFromPortal(p) {
   const audit = c.audit_columns || {}
   return {
     id: p.id, name: p.name, description: p.description || '', is_active: p.is_active,
-    target_table: c.target_table || '', load_strategy: p.load_strategy,
+    target_table: c.target_table || '', staging_table: c.staging_table || '', load_strategy: p.load_strategy,
     columns: (c.columns?.length ? c.columns : [blankColumn()]).map(col => ({
       key: col.key, label: col.label || '', numeric: !!col.numeric,
       example: col.example || '', description: col.description || '',
@@ -37,6 +37,7 @@ function configFromForm(f, needsPeriod) {
       example: c.example.trim(), description: c.description.trim(),
     })),
   }
+  if (f.staging_table.trim()) cfg.staging_table = f.staging_table.trim()
   if (f.date_column) cfg.date_column = f.date_column
   if (f.date_format.trim()) cfg.date_format = f.date_format.trim()
   if (f.restrict_col) cfg.restrict_col = f.restrict_col
@@ -57,6 +58,9 @@ export default function AdminPortalsTab({ user, portals, strategies, loading, on
   const [saving, setSaving]     = useState(false)
   const [error, setError]       = useState('')
   const [notice, setNotice]     = useState('')
+  const [plan, setPlan]         = useState(null)    // what Fabric has for the staging table
+  const [planBusy, setPlanBusy] = useState(false)
+  const [planError, setPlanError] = useState('')
 
   const selectPortal = p => { setError(''); setNotice(''); setSelected(p.id); setForm(formFromPortal(p)) }
   const startNew = () => { setError(''); setNotice(''); setSelected('new'); setForm(emptyForm()) }
@@ -66,6 +70,27 @@ export default function AdminPortalsTab({ user, portals, strategies, loading, on
     setForm(f => ({ ...f, columns: f.columns.map((c, j) => (j === i ? { ...c, ...patch } : c)) }))
   const addColumn = () => setForm(f => ({ ...f, columns: [...f.columns, blankColumn()] }))
   const removeColumn = i => setForm(f => ({ ...f, columns: f.columns.filter((_, j) => j !== i) }))
+
+  useEffect(() => { setPlan(null); setPlanError('') }, [selected])
+
+  const checkStaging = async () => {
+    setPlanBusy(true); setPlanError(''); setPlan(null)
+    try {
+      setPlan(await adminApi(user, `/admin/portals/${encodeURIComponent(form.id)}/staging`))
+    } catch (e) { setPlanError(e.message) }
+    finally { setPlanBusy(false) }
+  }
+
+  const createStaging = async () => {
+    if (!window.confirm(`Create ${plan.staging_table} in Fabric now? This runs the statements shown below using the app's Fabric login.`)) return
+    setPlanBusy(true); setPlanError('')
+    try {
+      await adminApi(user, `/admin/portals/${encodeURIComponent(form.id)}/staging`, { method: 'POST', body: {} })
+      setPlan(await adminApi(user, `/admin/portals/${encodeURIComponent(form.id)}/staging`))
+      setNotice('Staging table created.')
+    } catch (e) { setPlanError(e.message) }
+    finally { setPlanBusy(false) }
+  }
 
   const strategyInfo = strategies.find(s => s.id === form?.load_strategy)
   const needsPeriod = strategyInfo ? strategyInfo.needs_period : form?.load_strategy === 'replace_period'
@@ -116,6 +141,7 @@ export default function AdminPortalsTab({ user, portals, strategies, loading, on
             <div className="ad-item-name">{p.name}</div>
             <div className="ad-item-meta">
               <span className={`ad-badge ad-badge-${p.load_strategy}`}>{STRATEGY_BADGE[p.load_strategy] || p.load_strategy}</span>
+              <span className={`ad-badge ${p.staged ? 'ad-badge-staged' : 'ad-badge-direct'}`}>{p.staged ? 'Staged' : 'Direct'}</span>
               {p.has_hooks && <span className="ad-badge ad-badge-hook">Python hook</span>}
               {!p.is_active && <span className="ad-badge ad-badge-off">Inactive</span>}
             </div>
@@ -221,6 +247,56 @@ export default function AdminPortalsTab({ user, portals, strategies, loading, on
                   <input value={form.audit_load_run_date} onChange={e => set({ audit_load_run_date: e.target.value })} placeholder="LOAD_RUN_DATE" />
                 </label>
               </div>
+            </div>
+
+            <div className="ad-card">
+              <div className="ad-card-head">Safe loading (staging table)</div>
+              <div className="ad-hint">
+                An upload is first loaded into a staging table in Fabric. Only when every row has arrived and been counted is the
+                live table changed, in a single transaction, so a dropped connection or a failed upload can never leave it
+                half-loaded or empty. Leave this blank to load straight into the live table (not protected).
+              </div>
+              <div className="ad-grid">
+                <label>Staging table (Fabric)
+                  <input value={form.staging_table} onChange={e => set({ staging_table: e.target.value })}
+                         placeholder={form.target_table.includes('.') ? `stg.${form.target_table.split('.')[1]}` : 'stg.DIM_STORE_MASTER'} />
+                </label>
+                <div className="ad-stagingbtns">
+                  {!form.staging_table && form.target_table.includes('.') && (
+                    <button type="button" className="btn-outline" onClick={() => set({ staging_table: `stg.${form.target_table.split('.')[1]}` })}>
+                      Use stg.{form.target_table.split('.')[1]}
+                    </button>
+                  )}
+                  {!isNew && (
+                    <button type="button" className="btn-outline" onClick={checkStaging}
+                            disabled={planBusy || !existing?.staged || form.staging_table.trim() !== (existing?.config?.staging_table || '')}>
+                      {planBusy ? 'Checking…' : 'Check in Fabric'}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {!isNew && !existing?.staged && form.staging_table.trim() && (
+                <div className="ad-hint">Save changes first, then you can check and create the staging table.</div>
+              )}
+              {planError && <div className="ad-inline-error">{planError}</div>}
+              {plan?.fabric_error && <div className="ad-inline-error">Could not read Fabric: {plan.fabric_error}</div>}
+              {plan && !plan.fabric_error && (
+                <div className="ad-plan">
+                  <div className={plan.target_found ? 'ad-ok' : 'ad-bad'}>{plan.target_found ? '✓' : '✗'} Live table {form.target_table} {plan.target_found ? 'found' : 'not found in Fabric'}</div>
+                  <div className={plan.staging_exists ? 'ad-ok' : 'ad-warn'}>{plan.staging_exists ? '✓' : '•'} Staging table {plan.staging_table} {plan.staging_exists ? 'exists' : 'does not exist yet'}</div>
+                  {plan.staging_exists && plan.missing_columns.length === 0 && <div className="ad-ok">✓ It has every column this portal needs — ready to use.</div>}
+                  {plan.missing_columns.length > 0 && <div className="ad-bad">✗ Missing columns: {plan.missing_columns.join(', ')}</div>}
+                  {plan.ddl_error && <div className="ad-bad">✗ {plan.ddl_error}</div>}
+                  {plan.statements.length > 0 && (
+                    <>
+                      <div className="ad-hint">These statements will be run:</div>
+                      <pre className="ad-ddl">{plan.statements.join(';\n\n')};</pre>
+                      <div className="ad-hint">Or run them yourself in Fabric if the app's login can't create tables.</div>
+                      <button type="button" className="btn-primary" onClick={createStaging} disabled={planBusy}>Create staging table</button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="ad-card">

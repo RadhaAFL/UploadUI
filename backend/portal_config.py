@@ -43,6 +43,17 @@ def validate_portal_config(config) -> dict:
         errors.append(f"load_strategy must be one of: {', '.join(load_strategies.STRATEGIES)}.")
     out["load_strategy"] = strategy
 
+    # Optional: where an upload is loaded first, before the live table is swapped
+    # in one transaction (see publisher.py). Must be a different table.
+    staging = _text(config.get("staging_table"), 130)
+    if staging:
+        if not TABLE_RE.match(staging):
+            errors.append("staging_table must look like schema.TableName (letters, digits, underscore).")
+        elif staging.lower() == table.lower():
+            errors.append("staging_table must be a different table from target_table.")
+        else:
+            out["staging_table"] = staging
+
     # ── columns ──
     raw_columns = config.get("columns")
     columns, keys = [], []

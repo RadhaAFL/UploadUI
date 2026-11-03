@@ -60,15 +60,24 @@ def check_allowed(strategy: str, restrict_values) -> None:
         )
 
 
-def prepare_target(strategy: str, cursor, config: dict, period: "dict | None", brands: list) -> int:
+def prepare_target(strategy: str, cursor, config: dict, period: "dict | None", brands: list,
+                   transactional: bool = False) -> int:
     """Run the strategy's pre-insert step. Returns the number of existing
-    rows removed (0 for append)."""
+    rows removed (0 for append).
+
+    `transactional=True` is the staged swap: everything here runs inside the
+    swap transaction, so truncate_load uses a plain DELETE (which rolls back
+    with the rest) instead of TRUNCATE (whose behaviour inside a transaction
+    on Fabric isn't something we can count on)."""
     table = config["target_table"]
 
     if strategy == APPEND:
         return 0
 
     if strategy == TRUNCATE_LOAD:
+        if transactional:
+            cursor.execute(f"DELETE FROM {table}")
+            return cursor.rowcount if (cursor.rowcount or 0) > 0 else 0
         # TRUNCATE gives no row count, so count first for the audit trail.
         cursor.execute(f"SELECT COUNT(*) FROM {table}")
         existing = int(cursor.fetchone()[0])

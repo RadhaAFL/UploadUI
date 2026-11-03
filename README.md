@@ -72,6 +72,7 @@ Upload_Portal/
     load_strategies.py         # replace_period / truncate_load / append
     portal_config.py           # Validates admin-submitted portal configs (SQL identifiers!)
     portal_hooks.py            # Loads backend/portals/<id>.py hooks
+    publisher.py               # Staged publish (stage -> verify -> one-transaction swap) + direct fallback
     portals/                   # Per-portal Python hooks, one file per portal id
       _example_hooks.py        # Template — never loaded for a real portal
     requirements.txt
@@ -170,7 +171,9 @@ Base path in production: `/uploadportal-api`
 | `GET`/`DELETE` | `/admin/portals/<id>/access` | Admin: list / remove (`?email=`) a user's access |
 | `GET` | `/admin/strategies` | Admin: available load strategies |
 | `POST` | `/upload/start` | multipart: `portal_id, email, file` — validates only, stages result under an `upload_id` |
-| `POST` | `/upload/commit` | `{upload_id, email}` — deletes matching period+brand rows, bulk-inserts the staged rows |
+| `POST` | `/upload/commit` | `{upload_id, email}` — starts the publish as a background job, returns `202 {job_id}`. `409` if another upload to the portal is running (the validated file is kept) |
+| `GET` | `/upload/status?job_id=&email=` | Progress / outcome of a job: `state` (`starting`/`staging`/`publishing`/`done`/`failed`), rows, `live_changed` (`no`/`yes`/`unknown`) |
+| `GET`/`POST` | `/admin/portals/<id>/staging` | Admin: inspect Fabric for the portal's staging table + its DDL / create it |
 | `POST` | `/logs` | Audit log write |
 
 Note the `email` vs. `caller_email` split on admin endpoints that also
@@ -195,10 +198,58 @@ Portals saved before strategies existed have no `load_strategy` and behave as
 `replace_period`. The strategy used is recorded in the audit log and shown in
 the commit result.
 
-Validation happens fully in memory before anything is written, but the Fabric
-delete/truncate and the insert are separate autocommit statements: if the
-insert fails after a `truncate_load`, the table is left empty until the
-upload is re-run.
+Validation happens fully in memory before anything is written. How the rows
+then reach Fabric depends on whether the portal has a staging table — see
+**Staged publishing** below. Without one, the delete/truncate and the insert
+are separate autocommit statements, so a failure part-way leaves the live
+table partly loaded (or, for `truncate_load`, empty).
+
+## Staged publishing
+
+Set `staging_table` on a portal (Admin console → Portals → *Safe loading*) and
+an upload never changes the live table until it is complete:
+
+1. **Accept.** `/upload/commit` returns at once and the load runs in a
+   background thread; the page polls `/upload/status`. A closed tab or dropped
+   browser connection doesn't affect the load, and re-opening the portal shows
+   the running job again.
+2. **Stage.** Rows are inserted into the staging table tagged `UPLOAD_ID` +
+   `BATCH_NO`. A dropped Fabric connection is retried batch by batch — each
+   retry first deletes that batch's rows, so a batch that half-arrived can't
+   be doubled.
+3. **Verify.** The staging row count must equal the file's row count.
+4. **Swap — one transaction:** the strategy's delete (a plain `DELETE` even for
+   `truncate_load`, so it rolls back with the rest), `INSERT … SELECT` from
+   staging, delete the staging rows, `COMMIT`. If the connection dies *at*
+   `COMMIT` the outcome is unknowable from the client, so the staging rows are
+   deleted inside the same transaction: after reconnecting, "no staging rows
+   left" proves it committed.
+
+The result is that the live table holds the old data or the new data, never
+half of each and never blank. On any failure the user is told whether the
+live table changed (`live_changed`: `no` / `yes` / `unknown`).
+
+**One upload per portal at a time.** A second user is rejected with a message
+naming who is uploading and asking them to try again; their validated file is
+kept, so pressing Confirm again once the portal is free works. The lock is
+in-process, which is why the API must run as a **single gunicorn worker**.
+A server restart mid-upload marks the job failed at start-up (and clears its
+staging rows).
+
+### Setting up a staging table
+
+The app's Fabric login needs permission to `CREATE TABLE` (and `CREATE SCHEMA`
+for a new schema), or an admin can run the DDL by hand. In the console:
+Portals → pick the portal → set *Staging table* (e.g. `stg.DIM_STORE_MASTER`) →
+**Save** → **Check in Fabric** (shows what exists and the exact DDL, built from
+the live table's own column types) → **Create staging table**. A staging table
+is the live table's loaded columns plus `UPLOAD_ID varchar(40)` and
+`BATCH_NO int`; it must be a different table from the live one.
+
+**Not yet exercised against a real Fabric warehouse.** The behaviour above is
+tested against a stand-in warehouse (DuckDB) with injected failures; Fabric's
+own transaction semantics (`BEGIN`/`COMMIT` around `DELETE` + `INSERT … SELECT`)
+should be confirmed on a small non-production table before relying on it.
 
 ### Dates in text files
 
@@ -321,7 +372,8 @@ WantedBy=multi-user.target
 ```
 
 One gunicorn worker — DuckDB opens `data/app.duckdb` as a single local file,
-so only one process may hold it.
+so only one process may hold it, and the per-portal upload lock is in-process.
+Uploads run on background threads inside that worker.
 
 ```bash
 sudo systemctl daemon-reload
